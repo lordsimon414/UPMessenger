@@ -153,6 +153,84 @@ impl ApiClient {
     }
 
 
+    pub fn publish_one_time_prekeys(
+        &self,
+        token: &str,
+        prekeys: &[(String, String, String)],
+    ) -> Result<usize, ApiError> {
+        #[derive(Serialize)]
+        struct Item<'a> { prekey_id: &'a str, public_key: &'a str, signature: &'a str }
+        #[derive(Serialize)]
+        struct Body<'a> { prekeys: Vec<Item<'a>> }
+        #[derive(Deserialize)]
+        struct ResponseBody { published: usize }
+        let items = prekeys.iter().map(|(id, public_key, signature)| Item {
+            prekey_id: id,
+            public_key,
+            signature,
+        }).collect();
+        let response = self.http.post(self.url("/v1/devices/prekeys"))
+            .bearer_auth(token)
+            .json(&Body { prekeys: items })
+            .send()?;
+        Ok(self.check::<ResponseBody>(response)?.published)
+    }
+
+    pub fn claim_one_time_prekey(
+        &self,
+        token: &str,
+        device_id: &str,
+    ) -> Result<Option<(String, String, String)>, ApiError> {
+        #[derive(Serialize)]
+        struct RequestBody<'a> { device_id: &'a str }
+        #[derive(Deserialize)]
+        struct ResponseBody {
+            available: bool,
+            prekey_id: Option<String>,
+            public_key: Option<String>,
+            signature: Option<String>,
+        }
+        let response = self.http.post(self.url("/v1/devices/prekeys/claim"))
+            .bearer_auth(token)
+            .json(&RequestBody { device_id })
+            .send()?;
+        let body: ResponseBody = self.check(response)?;
+        if !body.available { return Ok(None); }
+        Ok(Some((
+            body.prekey_id.ok_or_else(|| ApiError::Server { status: 500, message: "server returned incomplete prekey".into() })?,
+            body.public_key.ok_or_else(|| ApiError::Server { status: 500, message: "server returned incomplete prekey".into() })?,
+            body.signature.ok_or_else(|| ApiError::Server { status: 500, message: "server returned incomplete prekey".into() })?,
+        )))
+    }
+
+    pub fn create_attachment(&self, token: &str, opaque_size: i64) -> Result<String, ApiError> {
+        #[derive(Serialize)] struct Body { opaque_size: i64 }
+        #[derive(Deserialize)] struct ResponseBody { attachment_id: String }
+        let response = self.http.post(self.url("/v1/attachments/create"))
+            .bearer_auth(token).json(&Body { opaque_size }).send()?;
+        Ok(self.check::<ResponseBody>(response)?.attachment_id)
+    }
+
+    pub fn upload_attachment_blob(&self, token: &str, attachment_id: &str, blob: &[u8]) -> Result<(), ApiError> {
+        let path = format!("/v1/attachments/{}/blob", urlencoding::encode(attachment_id));
+        let response = self.http.put(self.url(&path)).bearer_auth(token).body(blob.to_vec()).send()?;
+        if !response.status().is_success() {
+            return Err(ApiError::Server { status: response.status().as_u16(), message: response.text().unwrap_or_default() });
+        }
+        Ok(())
+    }
+
+    pub fn download_attachment_blob(&self, token: &str, attachment_id: &str) -> Result<Vec<u8>, ApiError> {
+        let path = format!("/v1/attachments/{}/blob", urlencoding::encode(attachment_id));
+        let response = self.http.get(self.url(&path)).bearer_auth(token).send()?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ApiError::Server { status: status.as_u16(), message: response.text().unwrap_or_default() });
+        }
+        Ok(response.bytes()?.to_vec())
+    }
+
+
     pub fn device_keys(&self, device_id: &str) -> Result<DeviceKeyBundle, ApiError> {
         let path = format!("/v1/devices/keys/{}", urlencoding::encode(device_id));
         let response = self.http.get(self.url(&path)).send()?;
@@ -164,6 +242,13 @@ impl ApiClient {
         let response = self.http.get(self.url(&path)).send()?;
         self.check(response)
     }
+
+    pub fn resolve_upm_id(&self, upm_id: &str) -> Result<DirectoryEntry, ApiError> {
+        let path = format!("/v1/directory/resolve-id/{}", urlencoding::encode(upm_id));
+        let response = self.http.get(self.url(&path)).send()?;
+        self.check(response)
+    }
+
 
     pub fn pull(&self, token: &str, device_id: &str) -> Result<Vec<PullEnvelope>, ApiError> {
         let path = format!("/v1/messages/pull?device_id={}", urlencoding::encode(device_id));

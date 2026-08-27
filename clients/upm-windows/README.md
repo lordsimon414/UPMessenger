@@ -7,7 +7,7 @@ Initial Phase 3 Windows desktop client shell, built on the shared UPM Rust proto
 - Native desktop window via `eframe`/`winit`.
 - UPM account registration using the device Ed25519 identity key.
 - Challenge-response authentication.
-- X3DH device-key bundle publication after authentication.
+- UPM X3DH-style device-key bundle publication, including signed one-time prekeys.
 - Username directory resolution.
 - Authenticated message queue polling and recipient-scoped acknowledgement.
 - Remote X3DH-lite prekey-bundle retrieval and peer identity verification.
@@ -17,7 +17,7 @@ Initial Phase 3 Windows desktop client shell, built on the shared UPM Rust proto
 
 ## Remaining Phase 3 gaps
 
-The Windows client now stores decrypted message history and serialized Double-Ratchet state in a local SQLite database, with each record encrypted using a random-nonce ChaCha20-Poly1305 key held through the Windows credential-store abstraction. Full X3DH one-time prekeys, encrypted attachment blob upload/download, stronger key-change UX, and Android remain next steps.
+The Windows client stores decrypted message history and serialized Double-Ratchet state in a local SQLite database, with each record encrypted using a random-nonce ChaCha20-Poly1305 key held through the Windows credential-store abstraction. Android integration, stronger key-change UX, and broader interoperability/security testing remain next steps. The UPM X3DH-style construction is not claimed to be standards-compatible X3DH/Signal without independent review.
 
 Build on Windows with:
 

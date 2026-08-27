@@ -74,7 +74,7 @@ pub struct SessionSnapshot {
 
 fn kdf_rk(root_key: &[u8; 32], dh_output: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), SessionError> {
     let mut okm = [0u8; 64];
-    upm_crypto::derive(root_key, dh_output, b"upm/v2/ratchet/root-step", &mut okm)?;
+    upm_crypto::derive(root_key, dh_output, b"upm/v4/ratchet/root-step", &mut okm)?;
     let mut new_root = [0u8; 32];
     let mut chain_key = [0u8; 32];
     new_root.copy_from_slice(&okm[..32]);
@@ -93,14 +93,14 @@ fn kdf_ck(chain_key: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), SessionError> {
     upm_crypto::derive(
         chain_key,
         &[],
-        b"upm/v2/ratchet/chain-key",
+        b"upm/v4/ratchet/chain-key",
         &mut next_chain_key,
     )?;
     let mut message_key = [0u8; 32];
     upm_crypto::derive(
         chain_key,
         &[],
-        b"upm/v2/ratchet/message-key",
+        b"upm/v4/ratchet/message-key",
         &mut message_key,
     )?;
     Ok((next_chain_key, message_key))
@@ -493,6 +493,9 @@ mod tests {
             identity_exchange_public: exchange.public_key(),
             signed_prekey_public: signed_prekey.public_key(),
             signed_prekey_signature: signature,
+            one_time_prekey_id: None,
+            one_time_prekey_public: None,
+            one_time_prekey_signature: None,
         };
         (
             bundle,
@@ -557,6 +560,52 @@ mod tests {
         let restored_snapshot = restored.snapshot();
         assert_eq!(restored_snapshot.peer_device, DeviceId([0xB; 16]));
         assert_eq!(restored_snapshot.protocol_version, ProtocolVersion::CURRENT);
+    }
+
+    #[test]
+    fn x3dh_style_opk_bootstrap_roundtrips_first_message() {
+        use crate::handshake::PreKeyBundle;
+        use upm_crypto::IdentityKeyPair;
+        use upm_protocol::PreKeyId;
+
+        let alice_signing = IdentityKeyPair::generate();
+        let alice_exchange = upm_crypto::AgreementSecret::generate();
+        let bob_signing = IdentityKeyPair::generate();
+        let bob_exchange = upm_crypto::AgreementSecret::generate();
+        let bob_signed = upm_crypto::AgreementSecret::generate();
+        let bob_opk_id = PreKeyId([0x42; 16]);
+        let bob_opk = upm_crypto::AgreementSecret::generate();
+
+        let mut signed_message = Vec::new();
+        signed_message.extend_from_slice(b"UPM/v4/signed-prekey/");
+        signed_message.extend_from_slice(&bob_exchange.public_key());
+        signed_message.extend_from_slice(&bob_signed.public_key());
+        let signed_sig = bob_signing.sign(&signed_message);
+        let opk_sig = bob_signing.sign(&crate::handshake::one_time_prekey_signature_message(bob_opk_id, &bob_opk.public_key()));
+
+        let bundle = PreKeyBundle {
+            identity_signing_public: bob_signing.public_key(),
+            identity_exchange_public: bob_exchange.public_key(),
+            signed_prekey_public: bob_signed.public_key(),
+            signed_prekey_signature: signed_sig,
+            one_time_prekey_id: Some(bob_opk_id),
+            one_time_prekey_public: Some(bob_opk.public_key()),
+            one_time_prekey_signature: Some(opk_sig),
+        };
+        let hs = crate::handshake::initiate(&alice_exchange, &bundle).unwrap();
+        let alice_device = DeviceId([1; 16]);
+        let bob_device = DeviceId([2; 16]);
+        let mut alice = DoubleRatchetSession::init_initiator(bob_device, &hs.result, hs.bob_initial_ratchet_public).unwrap();
+        let bob_hs = crate::handshake::respond(
+            &bob_exchange,
+            &bob_signed,
+            &hs.my_identity_exchange_public,
+            &hs.ephemeral_public,
+            Some(&bob_opk),
+        ).unwrap();
+        let mut bob = DoubleRatchetSession::init_responder(alice_device, &bob_hs, bob_signed);
+        let wire = alice.encrypt(b"hello with opk").unwrap();
+        assert_eq!(bob.decrypt(&wire).unwrap(), b"hello with opk");
     }
 
     #[test]

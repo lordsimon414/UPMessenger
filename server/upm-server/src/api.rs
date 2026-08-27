@@ -22,6 +22,8 @@ use crate::util::{base64_decode, base64_encode, decode_fixed};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::json;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response};
@@ -29,14 +31,63 @@ use upm_protocol::{DeviceId, MessageEnvelope, MessageId, ProtocolVersion};
 
 pub struct AppState {
     pub db: Mutex<Connection>,
+    pub attachment_dir: PathBuf,
 }
 
 pub fn handle(state: &AppState, mut request: Request) {
     let method = request.method().clone();
     let url = request.url().to_string();
     let bearer = extract_bearer(&request);
-    let mut body = String::new();
-    let _ = request.as_reader().read_to_string(&mut body);
+    let path = url.split('?').next().unwrap_or("");
+    let segments: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+
+    if segments.len() == 4 && segments[0] == "v1" && segments[1] == "attachments" && segments[3] == "blob" {
+        let auth_result = require_auth(state, bearer.as_deref());
+        match auth_result {
+            Ok(device_id) => {
+                let result = match method {
+                    Method::Put => handle_attachment_upload(state, &segments[2].to_ascii_uppercase(), &device_id, &mut request),
+                    Method::Get => handle_attachment_download(state, &segments[2].to_ascii_uppercase(), &device_id),
+                    _ => (405, Vec::new()),
+                };
+                let response = Response::from_data(result.1).with_status_code(result.0);
+                let _ = request.respond(response);
+            }
+            Err((status, body)) => {
+                let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
+                let response = Response::from_string(body).with_status_code(status).with_header(header);
+                let _ = request.respond(response);
+            }
+        }
+        return;
+    }
+
+    const MAX_JSON_BODY_BYTES: u64 = 2 * 1024 * 1024;
+    let mut raw_body = Vec::new();
+    if request.as_reader().take(MAX_JSON_BODY_BYTES + 1).read_to_end(&mut raw_body).is_err() {
+        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
+        let response = Response::from_string(error(400, "bad_request", "request body could not be read").1)
+            .with_status_code(400).with_header(header);
+        let _ = request.respond(response);
+        return;
+    }
+    if raw_body.len() as u64 > MAX_JSON_BODY_BYTES {
+        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
+        let response = Response::from_string(error(413, "request_too_large", "request body exceeds limit").1)
+            .with_status_code(413).with_header(header);
+        let _ = request.respond(response);
+        return;
+    }
+    let body = match String::from_utf8(raw_body) {
+        Ok(body) => body,
+        Err(_) => {
+            let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
+            let response = Response::from_string(error(400, "bad_request", "request body must be UTF-8 JSON").1)
+                .with_status_code(400).with_header(header);
+            let _ = request.respond(response);
+            return;
+        }
+    };
 
     let (status, json_body) = route(state, &method, &url, &body, bearer.as_deref());
 
@@ -93,6 +144,7 @@ fn route(
         // Open endpoints.
         (Method::Post, ["v1", "account", "register"]) => handle_register(state, body),
         (Method::Get, ["v1", "directory", "resolve", username]) => handle_resolve(state, username),
+        (Method::Get, ["v1", "directory", "resolve-id", upm_id]) => handle_resolve_upm_id(state, upm_id),
         (Method::Get, ["v1", "profile", "public", username]) => {
             handle_public_profile(state, username)
         }
@@ -103,6 +155,14 @@ fn route(
         (Method::Get, ["v1", "devices", "keys", device_id]) => handle_get_device_keys(state, device_id),
         (Method::Post, ["v1", "devices", "keys"]) => match require_auth(state, bearer) {
             Ok(authenticated_device) => handle_publish_keys(state, body, &authenticated_device),
+            Err(e) => e,
+        },
+        (Method::Post, ["v1", "devices", "prekeys"]) => match require_auth(state, bearer) {
+            Ok(authenticated_device) => handle_publish_one_time_prekeys(state, body, &authenticated_device),
+            Err(e) => e,
+        },
+        (Method::Post, ["v1", "devices", "prekeys", "claim"]) => match require_auth(state, bearer) {
+            Ok(_authenticated_device) => handle_claim_one_time_prekey(state, body),
             Err(e) => e,
         },
         (Method::Post, ["v1", "messages", "send"]) => match require_auth(state, bearer) {
@@ -221,6 +281,18 @@ fn handle_resolve(state: &AppState, username: &str) -> (u16, String) {
         Err(_) => error(500, "internal_error", "resolve failed"),
     }
 }
+fn handle_resolve_upm_id(state: &AppState, upm_id: &str) -> (u16, String) {
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::resolve_upm_id(&conn, upm_id) {
+        Ok(Some(entry)) => ok(
+            200,
+            json!({ "upm_id": entry.upm_id, "username": entry.username, "device_id": entry.device_id, "identity_public_key": entry.identity_public_key }),
+        ),
+        Ok(None) => error(404, "not_found", "no such UPM ID"),
+        Err(_) => error(500, "internal_error", "resolve failed"),
+    }
+}
+
 
 // ---------------------------------------------------------------------
 // POST /v1/auth/challenge, POST /v1/auth/verify
@@ -335,9 +407,10 @@ fn handle_publish_keys(state: &AppState, body: &str, authenticated_device: &str)
         Some(sig) => sig,
         None => return error(400, "invalid_key_bundle", "invalid X3DH device key material"),
     };
-    let mut signed_message = [0u8; 64];
-    signed_message[..32].copy_from_slice(&identity_exchange_public);
-    signed_message[32..].copy_from_slice(&signed_prekey_public);
+    let mut signed_message = Vec::with_capacity(21 + 32 + 32);
+    signed_message.extend_from_slice(b"UPM/v4/signed-prekey/");
+    signed_message.extend_from_slice(&identity_exchange_public);
+    signed_message.extend_from_slice(&signed_prekey_public);
     if upm_crypto::verify(&identity_public_key, &signed_message, &signature).is_err() {
         return error(400, "invalid_key_bundle", "X3DH prekey signature does not match device identity");
     }
@@ -352,6 +425,88 @@ fn handle_publish_keys(state: &AppState, body: &str, authenticated_device: &str)
         Ok(()) => ok(200, json!({ "device_id": authenticated_device })),
         Err(DbError::DeviceNotFound) => error(404, "device_not_found", "unknown authenticated device"),
         Err(_) => error(500, "internal_error", "key publication failed"),
+    }
+}
+
+#[derive(Deserialize)]
+struct PublishOneTimePreKeysRequest {
+    prekeys: Vec<PublishOneTimePreKeyItem>,
+}
+
+#[derive(Deserialize)]
+struct PublishOneTimePreKeyItem {
+    prekey_id: String,
+    public_key: String,
+    signature: String,
+}
+
+fn handle_publish_one_time_prekeys(state: &AppState, body: &str, authenticated_device: &str) -> (u16, String) {
+    let req: PublishOneTimePreKeysRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return error(400, "bad_request", "invalid one-time prekey payload"),
+    };
+    if req.prekeys.is_empty() || req.prekeys.len() > 128 {
+        return error(400, "invalid_prekeys", "one-time prekey batch size is invalid");
+    }
+    let conn = state.db.lock().expect("db mutex poisoned");
+    let identity_public_key = match db::get_device_identity_public_key(&conn, authenticated_device) {
+        Ok(key) => key,
+        Err(DbError::DeviceNotFound) => return error(404, "device_not_found", "unknown authenticated device"),
+        Err(_) => return error(500, "internal_error", "one-time prekey publication failed"),
+    };
+    let identity_public_key: [u8; 32] = match decode_fixed(&identity_public_key) {
+        Some(key) => key,
+        None => return error(500, "internal_error", "stored device identity key is invalid"),
+    };
+    let mut entries = Vec::with_capacity(req.prekeys.len());
+    for item in &req.prekeys {
+        let id = match upm_protocol::PreKeyId::from_hex(&item.prekey_id) {
+            Some(id) => id,
+            None => return error(400, "invalid_prekey", "invalid one-time prekey id"),
+        };
+        let public_key = match decode_fixed::<32>(&item.public_key) {
+            Some(key) => key,
+            None => return error(400, "invalid_prekey", "invalid one-time prekey public key"),
+        };
+        let signature = match decode_fixed::<64>(&item.signature) {
+            Some(sig) => sig,
+            None => return error(400, "invalid_prekey", "invalid one-time prekey signature"),
+        };
+        let message = upm_core::handshake::one_time_prekey_signature_message(id, &public_key);
+        if upm_crypto::verify(&identity_public_key, &message, &signature).is_err() {
+            return error(400, "invalid_prekey", "one-time prekey signature does not match device identity");
+        }
+        entries.push((item.prekey_id.clone(), item.public_key.clone(), item.signature.clone()));
+    }
+    match db::publish_one_time_prekeys(&conn, authenticated_device, &entries) {
+        Ok(published) => ok(200, json!({ "published": published })),
+        Err(DbError::DeviceNotFound) => error(404, "device_not_found", "unknown authenticated device"),
+        Err(_) => error(500, "internal_error", "one-time prekey publication failed"),
+    }
+}
+
+fn handle_claim_one_time_prekey(state: &AppState, body: &str) -> (u16, String) {
+    #[derive(Deserialize)]
+    struct ClaimRequest { device_id: String }
+    let req: ClaimRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return error(400, "bad_request", "invalid one-time prekey claim payload"),
+    };
+    let device_id = match DeviceId::from_hex(&req.device_id) {
+        Some(id) => id.to_hex(),
+        None => return error(400, "invalid_device_id", "device_id must be 16 bytes encoded as 32 hex characters"),
+    };
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::claim_one_time_prekey(&conn, &device_id) {
+        Ok(Some(record)) => ok(200, json!({
+            "available": true,
+            "prekey_id": record.prekey_id,
+            "public_key": record.public_key,
+            "signature": record.signature,
+        })),
+        Ok(None) => ok(200, json!({ "available": false })),
+        Err(DbError::DeviceNotFound) => error(404, "device_not_found", "unknown target device"),
+        Err(_) => error(500, "internal_error", "one-time prekey claim failed"),
     }
 }
 
@@ -566,12 +721,112 @@ fn handle_attachment_create(state: &AppState, body: &str, authenticated_device: 
 }
 
 fn handle_attachment_delete(state: &AppState, attachment_id: &str, authenticated_device: &str) -> (u16, String) {
+    let record = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        match db::get_attachment(&conn, attachment_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => return error(404, "not_found", "no such attachment"),
+            Err(_) => return error(500, "internal_error", "attachment lookup failed"),
+        }
+    };
+    if record.owner_device_id != authenticated_device {
+        return error(403, "forbidden", "attachment does not belong to authenticated device");
+    }
     let conn = state.db.lock().expect("db mutex poisoned");
     match db::delete_attachment(&conn, authenticated_device, attachment_id) {
-        Ok(true) => ok(200, json!({ "deleted": true })),
+        Ok(true) => {
+            let _ = std::fs::remove_file(attachment_path(&state.attachment_dir, &record.storage_key));
+            ok(200, json!({ "deleted": true }))
+        }
         Ok(false) => error(404, "not_found", "no such attachment"),
         Err(_) => error(500, "internal_error", "attachment deletion failed"),
     }
+}
+
+fn attachment_path(root: &Path, storage_key: &str) -> PathBuf {
+    root.join(format!("{storage_key}.blob"))
+}
+
+fn handle_attachment_upload(
+    state: &AppState,
+    attachment_id: &str,
+    authenticated_device: &str,
+    request: &mut Request,
+) -> (u16, Vec<u8>) {
+    if DeviceId::from_hex(attachment_id).is_none() {
+        return (400, b"invalid attachment id".to_vec());
+    }
+    let record = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        match db::get_attachment(&conn, attachment_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => return (404, b"attachment not found".to_vec()),
+            Err(_) => return (500, b"attachment lookup failed".to_vec()),
+        }
+    };
+    if record.owner_device_id != authenticated_device {
+        return (403, b"forbidden".to_vec());
+    }
+    if record.expires_at <= current_unix_seconds() {
+        return (410, b"attachment expired".to_vec());
+    }
+    let max = record.opaque_size as u64;
+    let mut bytes = Vec::new();
+    if request.as_reader().take(max.saturating_add(1)).read_to_end(&mut bytes).is_err() {
+        return (400, b"attachment upload could not be read".to_vec());
+    }
+    if bytes.len() as u64 != max {
+        return (400, b"attachment size does not match reserved size".to_vec());
+    }
+    if std::fs::create_dir_all(&state.attachment_dir).is_err() {
+        return (500, b"attachment storage unavailable".to_vec());
+    }
+    let final_path = attachment_path(&state.attachment_dir, &record.storage_key);
+    let tmp_path = final_path.with_extension("blob.part");
+    if std::fs::write(&tmp_path, &bytes).is_err() || std::fs::rename(&tmp_path, &final_path).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return (500, b"attachment storage failed".to_vec());
+    }
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::mark_attachment_uploaded(&conn, attachment_id, authenticated_device) {
+        Ok(true) => (204, Vec::new()),
+        Ok(false) => {
+            let _ = std::fs::remove_file(&final_path);
+            (404, b"attachment state changed".to_vec())
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&final_path);
+            (500, b"attachment state update failed".to_vec())
+        }
+    }
+}
+
+fn handle_attachment_download(state: &AppState, attachment_id: &str, _authenticated_device: &str) -> (u16, Vec<u8>) {
+    if DeviceId::from_hex(attachment_id).is_none() {
+        return (400, b"invalid attachment id".to_vec());
+    }
+    let record = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        match db::get_attachment(&conn, attachment_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => return (404, b"attachment not found".to_vec()),
+            Err(_) => return (500, b"attachment lookup failed".to_vec()),
+        }
+    };
+    if record.expires_at <= current_unix_seconds() {
+        return (410, b"attachment expired".to_vec());
+    }
+    if !record.uploaded {
+        return (404, b"attachment blob not available".to_vec());
+    }
+    let bytes = match std::fs::read(attachment_path(&state.attachment_dir, &record.storage_key)) {
+        Ok(bytes) => bytes,
+        Err(_) => return (404, b"attachment blob not found".to_vec()),
+    };
+    if bytes.len() as i64 != record.opaque_size {
+        return (500, b"attachment integrity check failed".to_vec());
+    }
+    (200, bytes)
 }
 
 // ---------------------------------------------------------------------

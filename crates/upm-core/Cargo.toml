@@ -12,3 +12,5 @@ upm-protocol = { path = "../upm-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+rand = "0.8"

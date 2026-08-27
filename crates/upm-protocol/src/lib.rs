@@ -22,9 +22,9 @@ impl ProtocolVersion {
     /// The current protocol version implemented by this crate.
     /// Bump this — and record a migration note — whenever the wire format
     /// or cryptographic suite changes in an incompatible way. v2 binds both
-    /// X25519 identity-exchange and signed-prekey public keys in the
-    /// Ed25519 prekey signature and carries typed message-envelope metadata.
-    pub const CURRENT: ProtocolVersion = ProtocolVersion(3);
+    /// v4 adds independently signed one-time prekeys and binds them to
+    /// individual prekey identifiers while retaining typed envelopes.
+    pub const CURRENT: ProtocolVersion = ProtocolVersion(4);
 }
 
 /// Inclusive range of protocol versions a client or server build supports.
@@ -92,6 +92,9 @@ pub struct MessageEnvelope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MessageId(pub [u8; 16]);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PreKeyId(pub [u8; 16]);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeviceId(pub [u8; 16]);
 
@@ -118,6 +121,16 @@ impl MessageId {
         Self(bytes)
     }
 
+    pub fn from_hex(value: &str) -> Option<Self> {
+        decode_hex_16(value).map(Self)
+    }
+
+    pub fn to_hex(&self) -> String {
+        encode_hex(&self.0)
+    }
+}
+
+impl PreKeyId {
     pub fn from_hex(value: &str) -> Option<Self> {
         decode_hex_16(value).map(Self)
     }

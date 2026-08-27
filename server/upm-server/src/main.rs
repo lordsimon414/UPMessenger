@@ -21,8 +21,11 @@ fn main() {
     let db_path = std::env::var("UPM_DB_PATH").unwrap_or_else(|_| "upm.sqlite3".to_string());
 
     let conn = db::open(&db_path).expect("failed to open/initialize SQLite database");
+    let attachment_dir = std::env::var("UPM_ATTACHMENT_DIR").unwrap_or_else(|_| "upm-attachments".to_string());
+    std::fs::create_dir_all(&attachment_dir).expect("failed to create attachment storage directory");
     let state = AppState {
         db: Mutex::new(conn),
+        attachment_dir: attachment_dir.into(),
     };
 
     let server = Server::http(&bind_addr).expect("failed to bind HTTP listener");

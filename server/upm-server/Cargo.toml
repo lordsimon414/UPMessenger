@@ -9,6 +9,7 @@ description = "UPM delivery server (Windows 11 target, SRS §10). Phase 1: accou
 [dependencies]
 upm-protocol = { path = "../../crates/upm-protocol" }
 upm-crypto = { path = "../../crates/upm-crypto" }
+upm-core = { path = "../../crates/upm-core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

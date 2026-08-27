@@ -2,13 +2,13 @@
 //! (`upm-crypto`), wire format (`upm-protocol`), and platform clients.
 //!
 //! # Status: Phase 2 — working implementation
-//! `handshake` implements an X3DH-lite key agreement and `ratchet`
-//! implements a Double-Ratchet-style session (`DoubleRatchetSession`) on
-//! top of it, providing forward secrecy, out-of-order delivery within a
-//! bounded window, and fail-closed replay/tamper rejection (AC-05, AC-06,
-//! SRS §8). See `ratchet.rs` module docs for the specific, documented
-//! scope limits (no one-time prekey yet, bounded skipped-key window).
+//! `handshake` implements a UPM X3DH-style key agreement with signed
+//! one-time-prekey support and `ratchet` implements a Double-Ratchet-style
+//! session (`DoubleRatchetSession`) on top of it, providing forward secrecy,
+//! bounded out-of-order delivery, and fail-closed replay/tamper rejection
+//! (AC-05, AC-06, SRS §8).
 
+pub mod attachments;
 pub mod handshake;
 pub mod ratchet;
 

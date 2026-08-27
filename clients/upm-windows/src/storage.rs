@@ -1,6 +1,7 @@
 use base64::Engine;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
+use upm_protocol::PreKeyId;
 
 const SERVICE: &str = "UPM";
 const ACCOUNT: &str = "local-profile";
@@ -41,10 +42,18 @@ pub fn clear() -> Result<(), String> {
 
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoredOneTimePreKey {
+    pub id: PreKeyId,
+    pub private_b64: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LocalSecrets {
     pub signing_private_b64: String,
     pub exchange_private_b64: String,
     pub signed_prekey_private_b64: String,
+    #[serde(default)]
+    pub one_time_prekeys: Vec<StoredOneTimePreKey>,
 }
 
 fn load_entry(account: &str) -> Option<Entry> {
@@ -63,11 +72,20 @@ pub fn save_secrets(secrets: &LocalSecrets) -> Result<(), String> {
     entry.set_password(&json).map_err(|e| e.to_string())
 }
 
-pub fn local_secrets_from_bytes(signing: [u8;32], exchange: [u8;32], signed_prekey: [u8;32]) -> LocalSecrets {
+pub fn local_secrets_from_bytes(
+    signing: [u8; 32],
+    exchange: [u8; 32],
+    signed_prekey: [u8; 32],
+    one_time_prekeys: Vec<(PreKeyId, [u8; 32])>,
+) -> LocalSecrets {
     let enc = base64::engine::general_purpose::STANDARD;
     LocalSecrets {
         signing_private_b64: enc.encode(signing),
         exchange_private_b64: enc.encode(exchange),
         signed_prekey_private_b64: enc.encode(signed_prekey),
+        one_time_prekeys: one_time_prekeys
+            .into_iter()
+            .map(|(id, key)| StoredOneTimePreKey { id, private_b64: enc.encode(key) })
+            .collect(),
     }
 }

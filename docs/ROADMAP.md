@@ -4,8 +4,8 @@
 |---|---|---|---|
 | 0. Foundation | Repo structure, protocol versioning, Rust core boundaries, CI, threat model | P0 | **Implemented** |
 | 1. Server skeleton | Windows service, SQLite schema, TLS, account directory, queue | P0 | **Partially done**: SQLite schema, REST API, challenge-response auth, device-scoped pull/ack, bounded TTL queue, and localhost binding are implemented. Windows-service packaging and deployment hardening remain open. |
-| 2. Crypto/session core | Identity keys, session establishment, ratchet integration, envelope format | P0 | **Partially done**: primitive wrappers, X3DH-lite, transactional Double-Ratchet-style session, and versioned server queue envelopes are implemented. Full X3DH OPKs, persistence, and complete shared-envelope integration remain open. |
-| 3. Windows + Android | 1:1 messaging, encrypted local DB, attachments | P0 | **In progress**: Windows 1:1 peer session, X3DH-lite bootstrap, Double-Ratchet message encryption/decryption, encrypted local message/session records, and authenticated queue flow are wired; attachments, Android client, stronger key-change UX, and full X3DH OPKs remain |
+| 2. Crypto/session core | Identity keys, session establishment, ratchet integration, envelope format | P0 | **Partially done**: primitive wrappers, UPM X3DH-style OPKs, transactional Double-Ratchet-style session, versioned server queue envelopes, and restart-persistent client session/history state are implemented. A standards-compatible Signal/X3DH implementation is not claimed and still requires independent review. |
+| 3. Windows + Android | 1:1 messaging, encrypted local DB, attachments | P0 | **In progress**: Windows 1:1 E2EE, UPM X3DH-style OPKs, transactional Double-Ratchet state, encrypted local history/outbox recovery, and client-side encrypted attachment upload/download are wired. Android client and stronger key-change UX remain. |
 | 4. iOS | Shared core integration, Keychain, APNs-compatible wakeup flow | P0 | Not started |
 | 5. Web | WASM core, browser storage, secure-session UX | P0 | Not started |
 | 6. Small groups | Group key epochs, membership lifecycle, attachment sharing | P1 | Not started |
@@ -23,10 +23,11 @@
   labels, ChaCha20-Poly1305 AEAD. All backed by maintained crates, not
   hand-rolled.
 - `upm-core`: **working session layer**.
-  - `handshake.rs`: X3DH-lite key agreement (identity exchange key +
-    signed prekey, no one-time prekey yet — documented gap, see below)
-    producing a shared root key and initial chain keys. The Ed25519
-    signature binds both published X25519 public keys to the device identity.
+  - `handshake.rs`: UPM X3DH-style key agreement using identity-exchange key,
+    signed prekey, and an optional signed one-time prekey. The Ed25519
+    signatures bind the published X25519 public keys and prekey IDs to the
+    device identity. This is intentionally not labeled standards-compatible
+    X3DH/Signal without independent review.
   - `ratchet.rs`: `DoubleRatchetSession` — a full Double-Ratchet-style
     implementation (DH ratchet + per-direction symmetric-key chains,
     skipped-message-key storage bounded at 1000 messages, JSON+base64
@@ -37,13 +38,13 @@
     out-of-order delivery within one chain, replay rejection, tamper
     rejection. 8 tests, all green.
   - Security hardening now includes **transactional decrypt**: failed AEAD
-    authentication no longer commits ratchet/DH/skipped-key state. The
-    remaining session gaps are no one-time prekeys and session persistence.
+    authentication no longer commits ratchet/DH/skipped-key state, and the
+    Windows client commits decrypted history, processed-message markers, and
+    session snapshots atomically.
   - `upm-protocol::MessageEnvelope` now uses fixed 16-byte hex identifiers
-    in JSON, `MessageId::random()` provides sender-side IDs, and
-    `DoubleRatchetSession::encrypt_envelope()` packages authenticated
-    ciphertext into the typed envelope. The HTTP client integration remains
-    part of Phase 3.
+    in JSON, `MessageId::random()` provides sender-side IDs, and the Windows
+    client sends typed envelopes through `/v1/messages/send`. Protocol v4
+    binds the X3DH-style bootstrap to the intended recipient device.
   - `/v1/devices/keys` refreshes the authenticated device's X3DH bundle
     (X25519 identity-exchange key, signed prekey, and Ed25519 signature)
     rather than creating an arbitrary device for a caller-supplied account.
@@ -72,19 +73,13 @@
 
 ## Next concrete steps
 
-1. Add a one-time-prekey table/server operation and extend the handshake to
-   full X3DH, closing the documented initial-handshake gap.
-2. Expand the encrypted Windows local store with stronger transactional
-   outbox/restart recovery semantics and key-change state.
-3. Add encrypted attachment blob upload/download and ownership checks.
-4. Package `upm-server` as a Windows service, add Windows CI, and document
-   filesystem ACL/firewall/Cloudflare Tunnel deployment.
-5. Add request/queue/disk quotas, fuzz/property tests, privacy-log tests,
-   persistence/restart tests, and cross-platform interoperability tests.
-6. Run an independent security review before wider real-world use, as
-   required by the SRS release posture.
-
+1. Add stronger device/key-change UX and explicit trust-state screens in the Windows client.
+2. Package `upm-server` as a Windows service and document filesystem ACL/firewall/Cloudflare Tunnel deployment.
+3. Add request/queue/disk quotas, fuzz/property tests, privacy-log tests, and restart/interoperability tests.
+4. Start Android client integration against the same protocol/core boundaries, followed by iOS and Web as specified in SRS §23.
+5. Keep the UPM X3DH-style design explicitly versioned; do not call it Signal/X3DH-compatible without independent review.
+6. Run an independent security review before wider real-world use, as required by the SRS release posture.
 
 ## Windows client status
 
-A Phase 3 Windows desktop client now exists under `clients/upm-windows`. It uses the shared Rust protocol/crypto crates and wires account registration, Ed25519 challenge-response authentication, X3DH-lite prekey publication/lookup, peer identity verification, first-message session bootstrap, Double-Ratchet-style 1:1 encryption/decryption, queue polling, authenticated acknowledgements, and encrypted local persistence of message history/session snapshots. Transactional outbox recovery and full attachment storage remain open.
+A Phase 3 Windows desktop client exists under `clients/upm-windows`. It uses the shared Rust protocol/crypto crates and wires account registration, Ed25519 challenge-response authentication, UPM X3DH-style signed/one-time prekey publication and claim, peer identity pinning, first-message bootstrap, Double-Ratchet-style 1:1 encryption/decryption, queue polling, authenticated acknowledgements, encrypted local persistence of message history/session snapshots, transactional outbox retry, and encrypted attachment upload/download. Android remains the next client target.

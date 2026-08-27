@@ -62,6 +62,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
 
+        CREATE TABLE IF NOT EXISTS one_time_prekeys (
+            prekey_id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL REFERENCES devices(device_id),
+            public_key TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            claimed_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_opk_device_claimed ON one_time_prekeys(device_id, claimed_at);
+
         CREATE TABLE IF NOT EXISTS conversations (
             conversation_id TEXT PRIMARY KEY,
             type            TEXT NOT NULL,
@@ -98,7 +108,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             owner_device_id   TEXT REFERENCES devices(device_id),
             opaque_size       INTEGER NOT NULL,
             storage_key       TEXT NOT NULL,
-            expires_at        INTEGER NOT NULL
+            expires_at        INTEGER NOT NULL,
+            uploaded_at       INTEGER
         );
 
         -- SRS §18: allow-listed, coarse, short-retained. No usernames,
@@ -120,6 +131,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE message_envelopes ADD COLUMN protocol_version INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE message_envelopes ADD COLUMN sender_device_id TEXT REFERENCES devices(device_id)",
         "ALTER TABLE attachments ADD COLUMN owner_device_id TEXT REFERENCES devices(device_id)",
+        "ALTER TABLE attachments ADD COLUMN uploaded_at INTEGER",
+        "ALTER TABLE one_time_prekeys ADD COLUMN signature TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = conn.execute(stmt, []);
     }
@@ -131,6 +144,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         "DELETE FROM message_envelopes WHERE protocol_version != ?1",
         params![ProtocolVersion::CURRENT.0 as i64],
     )?;
+    conn.execute("DELETE FROM one_time_prekeys WHERE signature = ''", [])?;
     Ok(())
 }
 
@@ -177,6 +191,8 @@ pub enum DbError {
     DeviceNotFound,
     #[error("invalid message envelope")]
     InvalidEnvelope,
+    #[error("message queue quota exceeded")]
+    QueueQuotaExceeded,
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -261,6 +277,32 @@ pub fn resolve_username(
              ORDER BY d.rowid ASC
              LIMIT 1",
             params![normalized],
+            |row| {
+                Ok(DirectoryEntry {
+                    upm_id: row.get(0)?,
+                    username: row.get(1)?,
+                    device_id: row.get(2)?,
+                    identity_public_key: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn resolve_upm_id(
+    conn: &Connection,
+    upm_id: &str,
+) -> Result<Option<DirectoryEntry>, DbError> {
+    let result = conn
+        .query_row(
+            "SELECT u.upm_id, u.username, d.device_id, d.identity_public_key
+             FROM users u
+             JOIN devices d ON d.user_id = u.user_id
+             WHERE u.upm_id = ?1 AND u.status = 'active'
+             ORDER BY d.rowid ASC
+             LIMIT 1",
+            params![upm_id],
             |row| {
                 Ok(DirectoryEntry {
                     upm_id: row.get(0)?,
@@ -369,6 +411,74 @@ pub fn get_device_prekey_bundle(
 }
 
 // ---------------------------------------------------------------------
+// One-time prekeys (SRS §6/§23)
+// ---------------------------------------------------------------------
+
+pub struct OneTimePreKeyRecord {
+    pub prekey_id: String,
+    pub public_key: String,
+    pub signature: String,
+}
+
+pub fn publish_one_time_prekeys(
+    conn: &Connection,
+    device_id: &str,
+    entries: &[(String, String, String)],
+) -> Result<usize, DbError> {
+    let exists: Option<String> = conn
+        .query_row(
+            "SELECT device_id FROM devices WHERE device_id = ?1",
+            params![device_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        return Err(DbError::DeviceNotFound);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut count = 0;
+    for (prekey_id, public_key, signature) in entries {
+        count += tx.execute(
+            "INSERT OR IGNORE INTO one_time_prekeys (prekey_id, device_id, public_key, signature, created_at, claimed_at)\
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            params![prekey_id, device_id, public_key, signature, now()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(count)
+}
+
+pub fn claim_one_time_prekey(
+    conn: &Connection,
+    device_id: &str,
+) -> Result<Option<OneTimePreKeyRecord>, DbError> {
+    let tx = conn.unchecked_transaction()?;
+    let candidate: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT prekey_id, public_key, signature FROM one_time_prekeys\
+             WHERE device_id = ?1 AND claimed_at IS NULL ORDER BY created_at ASC LIMIT 1",
+            params![device_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((prekey_id, public_key, signature)) = candidate else {
+        tx.commit()?;
+        return Ok(None);
+    };
+    let changed = tx.execute(
+        "UPDATE one_time_prekeys SET claimed_at = ?2\
+         WHERE prekey_id = ?1 AND device_id = ?3 AND claimed_at IS NULL",
+        params![prekey_id, now(), device_id],
+    )?;
+    tx.commit()?;
+    if changed == 1 {
+        Ok(Some(OneTimePreKeyRecord { prekey_id, public_key, signature }))
+    } else {
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------
 // Messaging (SRS §8, §16, §17)
 // ---------------------------------------------------------------------
 
@@ -418,6 +528,37 @@ pub fn enqueue_message(conn: &Connection, envelope: &MessageEnvelope) -> Result<
         .optional()?;
     if sender_exists.is_none() {
         return Err(DbError::DeviceNotFound);
+    }
+
+    if let Some(existing) = conn
+        .query_row(
+            "SELECT sender_device_id, recipient_device_id, protocol_version, ciphertext_blob FROM message_envelopes WHERE message_id = ?1",
+            params![message_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? as u16, row.get::<_, Vec<u8>>(3)?)),
+        )
+        .optional()?
+    {
+        if existing.0 == sender_device_id
+            && existing.1 == recipient_device_id
+            && existing.2 == envelope.protocol_version.0
+            && existing.3 == envelope.ciphertext
+        {
+            return Ok(message_id);
+        }
+        return Err(DbError::InvalidEnvelope);
+    }
+    let device_queue: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM message_envelopes WHERE recipient_device_id = ?1 AND delivery_state = 'queued'",
+        params![recipient_device_id],
+        |row| row.get(0),
+    )?;
+    let global_queue: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM message_envelopes WHERE delivery_state = 'queued'",
+        [],
+        |row| row.get(0),
+    )?;
+    if device_queue >= 10_000 || global_queue >= 100_000 {
+        return Err(DbError::QueueQuotaExceeded);
     }
 
     conn.execute(
@@ -502,8 +643,8 @@ pub struct AttachmentSlot {
 }
 
 /// Creates an upload slot. This only records opaque metadata (size,
-/// storage key) — the encrypted blob itself is handled by a separate
-/// object-storage path, not implemented in Phase 1.
+/// storage key). The encrypted blob is written separately by the HTTP API;
+/// the server never interprets its contents.
 pub fn create_attachment(
     conn: &Connection,
     owner_device_id: &str,
@@ -532,6 +673,43 @@ pub fn create_attachment(
         attachment_id,
         storage_key,
     })
+}
+
+pub struct AttachmentRecord {
+    pub attachment_id: String,
+    pub owner_device_id: String,
+    pub opaque_size: i64,
+    pub storage_key: String,
+    pub expires_at: i64,
+    pub uploaded: bool,
+}
+
+pub fn get_attachment(conn: &Connection, attachment_id: &str) -> Result<Option<AttachmentRecord>, DbError> {
+    Ok(conn.query_row(
+        "SELECT attachment_id, owner_device_id, opaque_size, storage_key, expires_at, uploaded_at\
+         FROM attachments WHERE attachment_id = ?1",
+        params![attachment_id],
+        |row| Ok(AttachmentRecord {
+            attachment_id: row.get(0)?,
+            owner_device_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            opaque_size: row.get(2)?,
+            storage_key: row.get(3)?,
+            expires_at: row.get(4)?,
+            uploaded: row.get::<_, Option<i64>>(5)?.is_some(),
+        }),
+    ).optional()?)
+}
+
+pub fn mark_attachment_uploaded(
+    conn: &Connection,
+    attachment_id: &str,
+    owner_device_id: &str,
+) -> Result<bool, DbError> {
+    Ok(conn.execute(
+        "UPDATE attachments SET uploaded_at = ?3\
+         WHERE attachment_id = ?1 AND owner_device_id = ?2 AND uploaded_at IS NULL",
+        params![attachment_id, owner_device_id, now()],
+    )? > 0)
 }
 
 pub fn delete_attachment(

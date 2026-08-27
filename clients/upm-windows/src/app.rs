@@ -1,4 +1,4 @@
-use crate::api::{ApiClient, DeviceKeyBundle, DirectoryEntry};
+use crate::api::{ApiClient, DirectoryEntry};
 use crate::identity::LocalIdentity;
 use crate::local_store::{LocalStore, OutboxItem};
 use crate::storage::{self, LocalProfile};
@@ -36,7 +36,10 @@ struct SessionBootstrap {
     sender_identity_exchange_public: [u8; 32],
     ephemeral_public: [u8; 32],
     one_time_prekey_id: Option<PreKeyId>,
-    signature: [u8; 64],
+    /// Base64-encoded Ed25519 signature (64 bytes). Stored as a string
+    /// rather than `[u8; 64]` because serde's built-in array support only
+    /// covers fixed arrays up to 32 elements; see `decode_64`/`encode_64`.
+    signature_base64: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -155,7 +158,7 @@ fn verify_bootstrap(
     upm_crypto::verify(
         &bootstrap.sender_identity_signing_public,
         &message,
-        &bootstrap.signature,
+        &decode_64(&bootstrap.signature_base64)?,
     )
     .map_err(|_| ClientCryptoError::InvalidBootstrapSignature)
 }
@@ -184,7 +187,8 @@ fn unix_now() -> i64 {
 fn fingerprint_hex(identity_public_key: &[u8; 32]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(identity_public_key);
-    digest.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().chunks(8).map(|c| String::from_utf8_lossy(c).to_string()).collect::<Vec<_>>().join(" ")
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    hex.as_bytes().chunks(8).map(|c| String::from_utf8_lossy(c).to_string()).collect::<Vec<_>>().join(" ")
 }
 
 pub struct UpmApp {
@@ -398,10 +402,10 @@ impl UpmApp {
             sender_identity_exchange_public: hs.my_identity_exchange_public,
             ephemeral_public: hs.ephemeral_public,
             one_time_prekey_id: hs.one_time_prekey_id,
-            signature: [0u8; 64],
+            signature_base64: String::new(),
         };
         let message = bootstrap_signature_message(peer_device, &bootstrap.sender_identity_exchange_public, &bootstrap.ephemeral_public, bootstrap.one_time_prekey_id);
-        bootstrap.signature = self.identity.signing.sign(&message);
+        bootstrap.signature_base64 = base64::engine::general_purpose::STANDARD.encode(self.identity.signing.sign(&message));
         let ratchet = session.encrypt(plaintext).map_err(|e| e.to_string())?;
         let packet = SessionPacket { protocol_version: ProtocolVersion::CURRENT.0, bootstrap: Some(bootstrap), ratchet_message_base64: base64::engine::general_purpose::STANDARD.encode(ratchet) };
         let envelope = MessageEnvelope { protocol_version: ProtocolVersion::CURRENT, message_id: MessageId::random(), sender_device_id: my_device, recipient_device_id: peer_device, ciphertext: encode_packet(&packet).map_err(|e| e.to_string())?, server_timestamp: 0, expires_at: 0 };

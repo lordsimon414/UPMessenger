@@ -123,7 +123,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             outcome           TEXT NOT NULL
         );
         "#,
-    );
+    )?;
 
     // Migrate databases created by the original Phase 1 scaffold. SQLite's
     // CREATE TABLE IF NOT EXISTS does not add newly introduced columns.
@@ -436,9 +436,9 @@ pub fn get_device_prekey_bundle(
             Ok(DevicePreKeyBundle {
                 device_id: row.get(0)?,
                 identity_public_key: row.get(1)?,
-                identity_exchange_public: row.get(2)?.unwrap_or_default(),
-                signed_prekey_public: row.get(3)?.unwrap_or_default(),
-                signed_prekey_signature: row.get(4)?.unwrap_or_default(),
+                identity_exchange_public: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                signed_prekey_public: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                signed_prekey_signature: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
             })
         },
     )
@@ -475,7 +475,7 @@ pub fn publish_one_time_prekeys(
     let mut count = 0;
     for (prekey_id, public_key, signature) in entries {
         count += tx.execute(
-            "INSERT OR IGNORE INTO one_time_prekeys (prekey_id, device_id, public_key, signature, created_at, claimed_at)\
+            "INSERT OR IGNORE INTO one_time_prekeys (prekey_id, device_id, public_key, signature, created_at, claimed_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
             params![prekey_id, device_id, public_key, signature, now()],
         )?;
@@ -491,7 +491,7 @@ pub fn claim_one_time_prekey(
     let tx = conn.unchecked_transaction()?;
     let candidate: Option<(String, String, String)> = tx
         .query_row(
-            "SELECT prekey_id, public_key, signature FROM one_time_prekeys\
+            "SELECT prekey_id, public_key, signature FROM one_time_prekeys \
              WHERE device_id = ?1 AND claimed_at IS NULL ORDER BY created_at ASC LIMIT 1",
             params![device_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -502,7 +502,7 @@ pub fn claim_one_time_prekey(
         return Ok(None);
     };
     let changed = tx.execute(
-        "UPDATE one_time_prekeys SET claimed_at = ?2\
+        "UPDATE one_time_prekeys SET claimed_at = ?2 \
          WHERE prekey_id = ?1 AND device_id = ?3 AND claimed_at IS NULL",
         params![prekey_id, now(), device_id],
     )?;
@@ -733,7 +733,7 @@ pub fn create_attachment(
 
     conn.execute(
         "INSERT INTO attachments (attachment_id, owner_message_id, owner_device_id, opaque_size, storage_key, capability_hash, expires_at)
-         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)",
+         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6)",
         params![attachment_id, owner_device_id, opaque_size, storage_key, capability_hash, expires_at],
     )?;
     Ok(AttachmentSlot {
@@ -755,7 +755,7 @@ pub struct AttachmentRecord {
 
 pub fn get_attachment(conn: &Connection, attachment_id: &str) -> Result<Option<AttachmentRecord>, DbError> {
     Ok(conn.query_row(
-        "SELECT attachment_id, owner_device_id, opaque_size, storage_key, capability_hash, expires_at, uploaded_at\
+        "SELECT attachment_id, owner_device_id, opaque_size, storage_key, capability_hash, expires_at, uploaded_at \
          FROM attachments WHERE attachment_id = ?1",
         params![attachment_id],
         |row| Ok(AttachmentRecord {
@@ -763,8 +763,9 @@ pub fn get_attachment(conn: &Connection, attachment_id: &str) -> Result<Option<A
             owner_device_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
             opaque_size: row.get(2)?,
             storage_key: row.get(3)?,
-            expires_at: row.get(4)?,
-            uploaded: row.get::<_, Option<i64>>(5)?.is_some(),
+            capability_hash: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            expires_at: row.get(5)?,
+            uploaded: row.get::<_, Option<i64>>(6)?.is_some(),
         }),
     ).optional()?)
 }
@@ -775,7 +776,7 @@ pub fn mark_attachment_uploaded(
     owner_device_id: &str,
 ) -> Result<bool, DbError> {
     Ok(conn.execute(
-        "UPDATE attachments SET uploaded_at = ?3\
+        "UPDATE attachments SET uploaded_at = ?3 \
          WHERE attachment_id = ?1 AND owner_device_id = ?2 AND uploaded_at IS NULL",
         params![attachment_id, owner_device_id, now()],
     )? > 0)
@@ -910,7 +911,12 @@ mod tests {
             sender_device_id: upm_protocol::DeviceId::from_hex(&acc.device_id).unwrap(),
             recipient_device_id: upm_protocol::DeviceId::from_hex(&acc.device_id).unwrap(),
             ciphertext: b"stale".to_vec(),
-            server_timestamp: now() as u64,
+            // Both timestamps are in the past (relative to the real clock),
+            // but expires_at is still after server_timestamp — a valid,
+            // already-expired-by-the-time-anyone-pulls-it envelope, as
+            // opposed to a nonsensical expires_at <= server_timestamp one
+            // (which enqueue_message rightly rejects as InvalidEnvelope).
+            server_timestamp: (now() - 100) as u64,
             expires_at: (now() - 1) as u64,
         };
         enqueue_message(&conn, &envelope).unwrap();

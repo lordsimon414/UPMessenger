@@ -1,7 +1,6 @@
 use base64::Engine;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use upm_protocol::ProtocolVersion;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {

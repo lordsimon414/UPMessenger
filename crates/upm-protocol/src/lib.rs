@@ -93,7 +93,7 @@ pub struct MessageEnvelope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MessageId(pub [u8; 16]);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PreKeyId(pub [u8; 16]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

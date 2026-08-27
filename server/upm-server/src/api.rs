@@ -810,7 +810,7 @@ fn handle_attachment_upload(
     if record.owner_device_id != authenticated_device {
         return (403, b"forbidden".to_vec());
     }
-    if record.expires_at <= current_unix_seconds() {
+    if record.expires_at <= current_unix_seconds() as i64 {
         return (410, b"attachment expired".to_vec());
     }
     let max = record.opaque_size as u64;
@@ -856,7 +856,7 @@ fn handle_attachment_download(state: &AppState, attachment_id: &str, _authentica
             Err(_) => return (500, b"attachment lookup failed".to_vec()),
         }
     };
-    if record.expires_at <= current_unix_seconds() {
+    if record.expires_at <= current_unix_seconds() as i64 {
         return (410, b"attachment expired".to_vec());
     }
     let Some(capability) = capability else {

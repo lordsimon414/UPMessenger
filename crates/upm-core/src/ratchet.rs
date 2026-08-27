@@ -487,9 +487,10 @@ mod tests {
         let signing = IdentityKeyPair::generate();
         let exchange = AgreementSecret::generate();
         let signed_prekey = AgreementSecret::generate();
-        let mut signature_message = [0u8; 64];
-        signature_message[..32].copy_from_slice(&exchange.public_key());
-        signature_message[32..].copy_from_slice(&signed_prekey.public_key());
+        let mut signature_message = Vec::new();
+        signature_message.extend_from_slice(b"UPM/v4/signed-prekey/");
+        signature_message.extend_from_slice(&exchange.public_key());
+        signature_message.extend_from_slice(&signed_prekey.public_key());
         let signature = signing.sign(&signature_message);
         let bundle = PreKeyBundle {
             identity_signing_public: signing.public_key(),
@@ -520,17 +521,18 @@ mod tests {
             &bob_secrets.signed_prekey,
             &alice_hs.my_identity_exchange_public,
             &alice_hs.ephemeral_public,
+            None,
         )
         .unwrap();
 
         let alice_session = DoubleRatchetSession::init_initiator(
-            DeviceId([0xA; 16]),
+            DeviceId([0xB; 16]),
             &alice_hs.result,
             alice_hs.bob_initial_ratchet_public,
         )
         .unwrap();
         let bob_session = DoubleRatchetSession::init_responder(
-            DeviceId([0xB; 16]),
+            DeviceId([0xA; 16]),
             &bob_hs,
             bob_secrets.signed_prekey,
         );
@@ -561,7 +563,7 @@ mod tests {
         assert_eq!(restored.decrypt(&reply).unwrap(), b"after snapshot");
 
         let restored_snapshot = restored.snapshot();
-        assert_eq!(restored_snapshot.peer_device, DeviceId([0xB; 16]));
+        assert_eq!(restored_snapshot.peer_device, DeviceId([0xA; 16]));
         assert_eq!(restored_snapshot.protocol_version, ProtocolVersion::CURRENT);
     }
 
@@ -571,7 +573,6 @@ mod tests {
         use upm_crypto::IdentityKeyPair;
         use upm_protocol::PreKeyId;
 
-        let alice_signing = IdentityKeyPair::generate();
         let alice_exchange = upm_crypto::AgreementSecret::generate();
         let bob_signing = IdentityKeyPair::generate();
         let bob_exchange = upm_crypto::AgreementSecret::generate();

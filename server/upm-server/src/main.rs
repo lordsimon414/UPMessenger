@@ -33,6 +33,10 @@ fn main() {
     println!(
         "Reminder: expose this only via a tunnel/reverse proxy that terminates TLS (SRS §10.1)."
     );
+    {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        let _ = db::reap_expired(&conn);
+    }
 
     for request in server.incoming_requests() {
         // Phase 1: handle requests sequentially against a single SQLite

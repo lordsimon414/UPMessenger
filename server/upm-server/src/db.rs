@@ -47,7 +47,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             username            TEXT NOT NULL UNIQUE,
             username_normalized TEXT NOT NULL UNIQUE,
             created_at          INTEGER NOT NULL,
-            status              TEXT NOT NULL DEFAULT 'active'
+            status              TEXT NOT NULL DEFAULT 'active',
+            directory_visible  INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS devices (
@@ -103,13 +104,14 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             ON message_envelopes(recipient_device_id, delivery_state);
 
         CREATE TABLE IF NOT EXISTS attachments (
-            attachment_id     TEXT PRIMARY KEY,
-            owner_message_id  TEXT,
-            owner_device_id   TEXT REFERENCES devices(device_id),
-            opaque_size       INTEGER NOT NULL,
-            storage_key       TEXT NOT NULL,
-            expires_at        INTEGER NOT NULL,
-            uploaded_at       INTEGER
+            attachment_id        TEXT PRIMARY KEY,
+            owner_message_id     TEXT,
+            owner_device_id      TEXT REFERENCES devices(device_id),
+            opaque_size          INTEGER NOT NULL,
+            storage_key          TEXT NOT NULL,
+            capability_hash      TEXT NOT NULL DEFAULT '',
+            expires_at            INTEGER NOT NULL,
+            uploaded_at           INTEGER
         );
 
         -- SRS §18: allow-listed, coarse, short-retained. No usernames,
@@ -126,12 +128,14 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     // Migrate databases created by the original Phase 1 scaffold. SQLite's
     // CREATE TABLE IF NOT EXISTS does not add newly introduced columns.
     for stmt in [
+        "ALTER TABLE users ADD COLUMN directory_visible INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE devices ADD COLUMN identity_exchange_public TEXT",
         "ALTER TABLE devices ADD COLUMN signed_prekey_signature TEXT",
         "ALTER TABLE message_envelopes ADD COLUMN protocol_version INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE message_envelopes ADD COLUMN sender_device_id TEXT REFERENCES devices(device_id)",
         "ALTER TABLE attachments ADD COLUMN owner_device_id TEXT REFERENCES devices(device_id)",
         "ALTER TABLE attachments ADD COLUMN uploaded_at INTEGER",
+        "ALTER TABLE attachments ADD COLUMN capability_hash TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE one_time_prekeys ADD COLUMN signature TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = conn.execute(stmt, []);
@@ -145,6 +149,10 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         params![ProtocolVersion::CURRENT.0 as i64],
     )?;
     conn.execute("DELETE FROM one_time_prekeys WHERE signature = ''", [])?;
+    // Older attachment rows have no capability secret to grant to a recipient.
+    // Remove them rather than silently preserving an attachment with weaker
+    // access control semantics.
+    conn.execute("DELETE FROM attachments WHERE capability_hash = ''", [])?;
     Ok(())
 }
 
@@ -232,16 +240,18 @@ pub fn register_account(
     let device_id = random_hex(16);
     let created_at = now();
 
-    conn.execute(
-        "INSERT INTO users (user_id, upm_id, username, username_normalized, created_at, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'active')",
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO users (user_id, upm_id, username, username_normalized, created_at, status, directory_visible)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active', 1)",
         params![user_id, upm_id, username, normalized, created_at],
     )?;
-    conn.execute(
+    tx.execute(
         "INSERT INTO devices (device_id, user_id, identity_public_key, capabilities)
          VALUES (?1, ?2, ?3, '[]')",
         params![device_id, user_id, identity_public_key],
     )?;
+    tx.commit()?;
 
     Ok(RegisteredAccount {
         user_id,
@@ -273,7 +283,7 @@ pub fn resolve_username(
             "SELECT u.upm_id, u.username, d.device_id, d.identity_public_key
              FROM users u
              JOIN devices d ON d.user_id = u.user_id
-             WHERE u.username_normalized = ?1 AND u.status = 'active'
+             WHERE u.username_normalized = ?1 AND u.status = 'active' AND u.directory_visible = 1
              ORDER BY d.rowid ASC
              LIMIT 1",
             params![normalized],
@@ -299,7 +309,7 @@ pub fn resolve_upm_id(
             "SELECT u.upm_id, u.username, d.device_id, d.identity_public_key
              FROM users u
              JOIN devices d ON d.user_id = u.user_id
-             WHERE u.upm_id = ?1 AND u.status = 'active'
+             WHERE u.upm_id = ?1 AND u.status = 'active' AND u.directory_visible = 1
              ORDER BY d.rowid ASC
              LIMIT 1",
             params![upm_id],
@@ -314,6 +324,32 @@ pub fn resolve_upm_id(
         )
         .optional()?;
     Ok(result)
+}
+
+pub fn set_directory_visibility(
+    conn: &Connection,
+    authenticated_device_id: &str,
+    visible: bool,
+) -> Result<(), DbError> {
+    let changed = conn.execute(
+        "UPDATE users SET directory_visible = ?2 WHERE user_id = (SELECT user_id FROM devices WHERE device_id = ?1) AND status = 'active'",
+        params![authenticated_device_id, if visible { 1 } else { 0 }],
+    )?;
+    if changed == 0 {
+        return Err(DbError::DeviceNotFound);
+    }
+    Ok(())
+}
+
+pub fn get_directory_visibility(
+    conn: &Connection,
+    authenticated_device_id: &str,
+) -> Result<bool, DbError> {
+    conn.query_row(
+        "SELECT u.directory_visible FROM users u JOIN devices d ON d.user_id = u.user_id WHERE d.device_id = ?1",
+        params![authenticated_device_id],
+        |row| Ok(row.get::<_, i64>(0)? != 0),
+    ).optional()?.ok_or(DbError::DeviceNotFound)
 }
 
 pub fn get_public_profile(
@@ -479,6 +515,18 @@ pub fn claim_one_time_prekey(
 }
 
 // ---------------------------------------------------------------------
+// Maintenance (SRS §17/§18 bounded retention)
+// ---------------------------------------------------------------------
+pub fn reap_expired(conn: &Connection) -> Result<(), DbError> {
+    let now_ts = now();
+    conn.execute("DELETE FROM message_envelopes WHERE expires_at <= ?1", params![now_ts])?;
+    conn.execute("DELETE FROM attachments WHERE expires_at <= ?1", params![now_ts])?;
+    conn.execute("DELETE FROM auth_challenges WHERE expires_at <= ?1", params![now_ts])?;
+    conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now_ts])?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
 // Messaging (SRS §8, §16, §17)
 // ---------------------------------------------------------------------
 
@@ -635,11 +683,28 @@ pub fn ack_messages(
 // Attachments (SRS §9, §16)
 // ---------------------------------------------------------------------
 
+fn hash_capability(capability: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(capability.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn attachment_capability_matches(record: &AttachmentRecord, capability: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    if record.capability_hash.is_empty() {
+        return false;
+    }
+    let digest = Sha256::digest(capability.as_bytes());
+    let candidate: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    candidate == record.capability_hash
+}
+
 pub const DEFAULT_ATTACHMENT_TTL_SECONDS: i64 = 30 * 24 * 3600;
 
 pub struct AttachmentSlot {
     pub attachment_id: String,
     pub storage_key: String,
+    pub capability: String,
 }
 
 /// Creates an upload slot. This only records opaque metadata (size,
@@ -662,16 +727,19 @@ pub fn create_attachment(
     }
     let attachment_id = random_hex(16);
     let storage_key = random_hex(24);
+    let capability = random_hex(32);
+    let capability_hash = hash_capability(&capability);
     let expires_at = now() + DEFAULT_ATTACHMENT_TTL_SECONDS;
 
     conn.execute(
-        "INSERT INTO attachments (attachment_id, owner_message_id, owner_device_id, opaque_size, storage_key, expires_at)
-         VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
-        params![attachment_id, owner_device_id, opaque_size, storage_key, expires_at],
+        "INSERT INTO attachments (attachment_id, owner_message_id, owner_device_id, opaque_size, storage_key, capability_hash, expires_at)
+         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![attachment_id, owner_device_id, opaque_size, storage_key, capability_hash, expires_at],
     )?;
     Ok(AttachmentSlot {
         attachment_id,
         storage_key,
+        capability,
     })
 }
 
@@ -680,13 +748,14 @@ pub struct AttachmentRecord {
     pub owner_device_id: String,
     pub opaque_size: i64,
     pub storage_key: String,
+    pub capability_hash: String,
     pub expires_at: i64,
     pub uploaded: bool,
 }
 
 pub fn get_attachment(conn: &Connection, attachment_id: &str) -> Result<Option<AttachmentRecord>, DbError> {
     Ok(conn.query_row(
-        "SELECT attachment_id, owner_device_id, opaque_size, storage_key, expires_at, uploaded_at\
+        "SELECT attachment_id, owner_device_id, opaque_size, storage_key, capability_hash, expires_at, uploaded_at\
          FROM attachments WHERE attachment_id = ?1",
         params![attachment_id],
         |row| Ok(AttachmentRecord {
@@ -746,6 +815,18 @@ mod tests {
             .expect("case-insensitive resolve");
         assert_eq!(entry.username, "max");
         assert_eq!(entry.identity_public_key, "pubkey-base64");
+    }
+
+    #[test]
+    fn directory_visibility_can_hide_and_restore_lookup() {
+        let conn = mem_db();
+        let acc = register_account(&conn, "alice", "k").unwrap();
+        assert!(resolve_username(&conn, "alice").unwrap().is_some());
+        set_directory_visibility(&conn, &acc.device_id, false).unwrap();
+        assert!(!get_directory_visibility(&conn, &acc.device_id).unwrap());
+        assert!(resolve_username(&conn, "alice").unwrap().is_none());
+        set_directory_visibility(&conn, &acc.device_id, true).unwrap();
+        assert!(resolve_username(&conn, "alice").unwrap().is_some());
     }
 
     #[test]
@@ -857,6 +938,9 @@ mod tests {
         let conn = mem_db();
         let acc = register_account(&conn, "alice", "k").unwrap();
         let slot = create_attachment(&conn, &acc.device_id, 1024).unwrap();
+        let record = get_attachment(&conn, &slot.attachment_id).unwrap().unwrap();
+        assert!(attachment_capability_matches(&record, &slot.capability));
+        assert!(!attachment_capability_matches(&record, "wrong-capability"));
         assert!(delete_attachment(&conn, &acc.device_id, &slot.attachment_id).unwrap());
         assert!(!delete_attachment(&conn, &acc.device_id, &slot.attachment_id).unwrap());
     }

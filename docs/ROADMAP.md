@@ -75,8 +75,8 @@
 
 1. Add stronger device/key-change UX and explicit trust-state screens in the Windows client.
 2. Package `upm-server` as a Windows service and document filesystem ACL/firewall/Cloudflare Tunnel deployment.
-3. Add request/queue/disk quotas, fuzz/property tests, privacy-log tests, and restart/interoperability tests.
-4. Start Android client integration against the same protocol/core boundaries, followed by iOS and Web as specified in SRS §23.
+3. Add request/queue/disk quotas, fuzz/property tests, privacy-log tests, and restart/interoperability tests. A local `upm-smoke` transport test now covers registration/authentication/send/pull/ack.
+4. Finish Windows security UX and platform abstraction work, then start Android client integration against the same protocol/core boundaries, followed by iOS and Web as specified in SRS §23.
 5. Keep the UPM X3DH-style design explicitly versioned; do not call it Signal/X3DH-compatible without independent review.
 6. Run an independent security review before wider real-world use, as required by the SRS release posture.
 

@@ -45,3 +45,19 @@ For a local development server:
 ```
 
 The server binds to `127.0.0.1:8787` by default and uses `upm-dev.sqlite3`. This is a development setup only; the production SRS deployment requires the documented localhost/tunnel/network-isolation arrangement.
+
+## Server smoke test
+
+With the development server running in one PowerShell window:
+
+```powershell
+cargo run -p upm-server
+```
+
+run the transport smoke test in another:
+
+```powershell
+cargo run -p upm-smoke -- http://127.0.0.1:8787
+```
+
+The smoke test deliberately does not claim to prove the cryptographic ratchet; it verifies the server's registration, challenge-response authentication, opaque envelope routing, protocol version handling, and recipient-scoped ACK behavior.

@@ -11,8 +11,10 @@ This review compares the repository implementation with UPM SRS 1.1 and records 
 - **Hashed session tokens:** bearer tokens are stored as SHA-256 digests rather than plaintext token values. Existing Phase 1 token tables are migrated on startup.
 - **Typed protocol envelope:** the server accepts sender-generated message IDs and a protocol version, constructs the shared `upm-protocol::MessageEnvelope` with authenticated sender/recipient device IDs, and rejects unsupported protocol versions.
 - **Windows 1:1 E2EE path:** the client now retrieves the peer's public X3DH-lite bundle, verifies peer identity continuity, signs the first-message bootstrap, establishes a Double-Ratchet-style session, encrypts/decrypts message content locally, and ACKs only after successful decryption.
-- **Attachment ownership:** attachment metadata create/delete operations are bound to the authenticated device.
-- **Protocol migration safety:** pre-v2 queued messages are removed during startup rather than relabeled as v2.
+- **Attachment access capability:** upload/delete operations are owner-bound; recipient download now requires a high-entropy capability delivered inside the E2EE payload. The server stores only a hash of that capability.
+- **Protocol migration safety:** queued envelopes from older incompatible revisions are removed during startup rather than relabeled as the current revision.
+- **Directory privacy control:** users can disable username/UPM-ID directory discovery for their account; hidden users are omitted from directory/public-profile resolution.
+- **Session revocation:** authenticated clients can explicitly revoke the current bearer session.
 
 ## Still release-blocking / intentionally outstanding
 
@@ -21,7 +23,7 @@ This review compares the repository implementation with UPM SRS 1.1 and records 
 - Native/Web clients are not implemented.
 - The server is still a console binary rather than a Windows service.
 - TLS/public deployment is still external to the server process; the intended deployment remains the SRS localhost + outbound tunnel model.
-- Encrypted attachment blob upload/download is not implemented; only metadata slots exist.
+- Attachment capabilities are now implemented, but full attachment UX, thumbnail encryption, and broader attachment interoperability remain outstanding.
 - Queue/disk quotas, fuzz/property tests, persistence/restart tests, privacy-log verification, cross-platform interoperability, and independent security review remain outstanding.
 
 Before wider real-world use, follow the SRS release gate: known critical findings must be fixed and residual risk explicitly accepted, with an independent security review of the protocol/key-management design.

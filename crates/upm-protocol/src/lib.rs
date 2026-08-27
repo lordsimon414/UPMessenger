@@ -21,8 +21,9 @@ pub struct ProtocolVersion(pub u16);
 impl ProtocolVersion {
     /// The current protocol version implemented by this crate.
     /// Bump this — and record a migration note — whenever the wire format
-    /// or cryptographic suite changes in an incompatible way. v2 binds both
-    /// v4 adds independently signed one-time prekeys and binds them to
+    /// or cryptographic suite changes in an incompatible way. v4 binds the
+    /// X3DH-style bootstrap to individual prekey identifiers and adds typed
+    /// envelopes with sender-device binding.
     /// individual prekey identifiers while retaining typed envelopes.
     pub const CURRENT: ProtocolVersion = ProtocolVersion(4);
 }

@@ -241,6 +241,18 @@ pub fn authenticate(conn: &Connection, token: &str) -> Result<String, AuthError>
     Ok(device_id)
 }
 
+/// Revokes exactly one bearer session. The plaintext bearer token is never stored.
+pub fn revoke_session(conn: &Connection, token: &str) -> Result<(), AuthError> {
+    if token.len() != 64 || !token.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AuthError::InvalidSession);
+    }
+    conn.execute(
+        "DELETE FROM sessions WHERE token_hash = ?1",
+        params![token_digest(token)],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +329,17 @@ mod tests {
             .unwrap();
         assert_eq!(stored_hash, token_digest(&token));
         assert_ne!(stored_hash, token);
+    }
+
+    #[test]
+    fn revoked_session_cannot_authenticate() {
+        let (conn, kp, device_id) = mem_db_with_device();
+        let challenge = issue_challenge(&conn, &device_id).unwrap();
+        let signature = base64_encode(&kp.sign(&challenge));
+        let (token, _) = verify_and_issue_session(&conn, &device_id, &signature).unwrap();
+        assert_eq!(authenticate(&conn, &token).unwrap(), device_id);
+        revoke_session(&conn, &token).unwrap();
+        assert!(matches!(authenticate(&conn, &token), Err(AuthError::InvalidSession)));
     }
 
     #[test]

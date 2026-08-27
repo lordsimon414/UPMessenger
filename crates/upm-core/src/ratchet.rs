@@ -305,38 +305,7 @@ impl DoubleRatchetSession {
     }
 }
 
-impl crate::Session for DoubleRatchetSession {
-    fn protocol_version(&self) -> ProtocolVersion {
-        self.protocol_version
-    }
-
-    fn peer_device(&self) -> DeviceId {
-        self.peer_device
-    }
-
-    fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, SessionError> {
-        let chain_key = self.sending_chain_key.ok_or(SessionError::NotEstablished)?;
-        let (next_chain_key, message_key) = kdf_ck(&chain_key)?;
-        self.sending_chain_key = Some(next_chain_key);
-
-        let header = RatchetHeader {
-            dh_pub: self.dh_self_public,
-            pn: self.prev_chain_len,
-            n: self.send_count,
-        };
-        self.send_count += 1;
-
-        let aad = serde_json::to_vec(&header).map_err(|_| WireError::Encoding)?;
-        let key = AeadKey::from_bytes(message_key);
-        let ciphertext = upm_crypto::encrypt(&key, &[0u8; 12], plaintext, &aad)?;
-
-        let wire = WireMessage {
-            header,
-            ciphertext_base64: base64_encode(&ciphertext),
-        };
-        serde_json::to_vec(&wire).map_err(|_| WireError::Encoding.into())
-    }
-
+impl DoubleRatchetSession {
     fn decrypt_inner(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, SessionError> {
         let wire: WireMessage =
             serde_json::from_slice(ciphertext).map_err(|_| WireError::Encoding)?;
@@ -394,6 +363,40 @@ impl crate::Session for DoubleRatchetSession {
         self.recv_count += 1;
         Ok(plaintext)
     }
+}
+
+impl crate::Session for DoubleRatchetSession {
+    fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+
+    fn peer_device(&self) -> DeviceId {
+        self.peer_device
+    }
+
+    fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, SessionError> {
+        let chain_key = self.sending_chain_key.ok_or(SessionError::NotEstablished)?;
+        let (next_chain_key, message_key) = kdf_ck(&chain_key)?;
+        self.sending_chain_key = Some(next_chain_key);
+
+        let header = RatchetHeader {
+            dh_pub: self.dh_self_public,
+            pn: self.prev_chain_len,
+            n: self.send_count,
+        };
+        self.send_count += 1;
+
+        let aad = serde_json::to_vec(&header).map_err(|_| WireError::Encoding)?;
+        let key = AeadKey::from_bytes(message_key);
+        let ciphertext = upm_crypto::encrypt(&key, &[0u8; 12], plaintext, &aad)?;
+
+        let wire = WireMessage {
+            header,
+            ciphertext_base64: base64_encode(&ciphertext),
+        };
+        serde_json::to_vec(&wire).map_err(|_| WireError::Encoding.into())
+    }
+
 
     /// Decryption is transactional: malformed or unauthenticated input must
     /// not advance or otherwise corrupt the ratchet state. Candidate state is

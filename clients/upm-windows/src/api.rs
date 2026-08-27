@@ -143,6 +143,21 @@ impl ApiClient {
         self.check(response)
     }
 
+    pub fn logout(&self, token: &str) -> Result<(), ApiError> {
+        let response = self.http.delete(self.url("/v1/auth/session"))
+            .bearer_auth(token).send()?;
+        let _: serde_json::Value = self.check(response)?;
+        Ok(())
+    }
+
+    pub fn set_directory_visibility(&self, token: &str, visible: bool) -> Result<(), ApiError> {
+        #[derive(Serialize)] struct Body { directory_visible: bool }
+        let response = self.http.post(self.url("/v1/profile/privacy"))
+            .bearer_auth(token).json(&Body { directory_visible: visible }).send()?;
+        let _: serde_json::Value = self.check(response)?;
+        Ok(())
+    }
+
     pub fn publish_keys(&self, token: &str, exchange: &str, signed_prekey: &str, signature: &str) -> Result<(), ApiError> {
         let response = self.http.post(self.url("/v1/devices/keys"))
             .bearer_auth(token)
@@ -203,12 +218,13 @@ impl ApiClient {
         )))
     }
 
-    pub fn create_attachment(&self, token: &str, opaque_size: i64) -> Result<String, ApiError> {
+    pub fn create_attachment(&self, token: &str, opaque_size: i64) -> Result<(String, String), ApiError> {
         #[derive(Serialize)] struct Body { opaque_size: i64 }
-        #[derive(Deserialize)] struct ResponseBody { attachment_id: String }
+        #[derive(Deserialize)] struct ResponseBody { attachment_id: String, capability: String }
         let response = self.http.post(self.url("/v1/attachments/create"))
             .bearer_auth(token).json(&Body { opaque_size }).send()?;
-        Ok(self.check::<ResponseBody>(response)?.attachment_id)
+        let result = self.check::<ResponseBody>(response)?;
+        Ok((result.attachment_id, result.capability))
     }
 
     pub fn upload_attachment_blob(&self, token: &str, attachment_id: &str, blob: &[u8]) -> Result<(), ApiError> {
@@ -220,9 +236,11 @@ impl ApiClient {
         Ok(())
     }
 
-    pub fn download_attachment_blob(&self, token: &str, attachment_id: &str) -> Result<Vec<u8>, ApiError> {
+    pub fn download_attachment_blob(&self, token: &str, attachment_id: &str, capability: &str) -> Result<Vec<u8>, ApiError> {
         let path = format!("/v1/attachments/{}/blob", urlencoding::encode(attachment_id));
-        let response = self.http.get(self.url(&path)).bearer_auth(token).send()?;
+        let response = self.http.get(self.url(&path)).bearer_auth(token)
+            .header("X-UPM-Attachment-Capability", capability)
+            .send()?;
         let status = response.status();
         if !status.is_success() {
             return Err(ApiError::Server { status: status.as_u16(), message: response.text().unwrap_or_default() });

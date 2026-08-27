@@ -45,9 +45,12 @@ pub fn handle(state: &AppState, mut request: Request) {
         let auth_result = require_auth(state, bearer.as_deref());
         match auth_result {
             Ok(device_id) => {
+                let capability = request.headers().iter().find(|h| {
+                    h.field.as_str().as_str().eq_ignore_ascii_case("X-UPM-Attachment-Capability")
+                }).map(|h| h.value.as_str().trim().to_string());
                 let result = match method {
                     Method::Put => handle_attachment_upload(state, &segments[2].to_ascii_uppercase(), &device_id, &mut request),
-                    Method::Get => handle_attachment_download(state, &segments[2].to_ascii_uppercase(), &device_id),
+                    Method::Get => handle_attachment_download(state, &segments[2].to_ascii_uppercase(), &device_id, capability.as_deref()),
                     _ => (405, Vec::new()),
                 };
                 let response = Response::from_data(result.1).with_status_code(result.0);
@@ -150,6 +153,14 @@ fn route(
         }
         (Method::Post, ["v1", "auth", "challenge"]) => handle_auth_challenge(state, body),
         (Method::Post, ["v1", "auth", "verify"]) => handle_auth_verify(state, body),
+        (Method::Delete, ["v1", "auth", "session"]) => match require_auth(state, bearer) {
+            Ok(_) => handle_logout(state, bearer.unwrap_or("")),
+            Err(e) => e,
+        },
+        (Method::Post, ["v1", "profile", "privacy"]) => match require_auth(state, bearer) {
+            Ok(device) => handle_profile_privacy(state, body, &device),
+            Err(e) => e,
+        },
 
         // Authenticated endpoints.
         (Method::Get, ["v1", "devices", "keys", device_id]) => handle_get_device_keys(state, device_id),
@@ -350,6 +361,30 @@ fn handle_auth_verify(state: &AppState, body: &str) -> (u16, String) {
         Err(AuthError::Malformed) => error(400, "bad_request", "malformed signature or stored key"),
         Err(AuthError::UnknownDevice) => error(404, "device_not_found", "unknown device_id"),
         Err(_) => error(500, "internal_error", "verification failed"),
+    }
+}
+
+fn handle_logout(state: &AppState, token: &str) -> (u16, String) {
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match auth::revoke_session(&conn, token) {
+        Ok(()) => ok(200, json!({ "logged_out": true })),
+        Err(_) => error(401, "unauthorized", "session could not be revoked"),
+    }
+}
+
+#[derive(Deserialize)]
+struct PrivacyRequest { directory_visible: bool }
+
+fn handle_profile_privacy(state: &AppState, body: &str, authenticated_device: &str) -> (u16, String) {
+    let req: PrivacyRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return error(400, "bad_request", "invalid privacy payload"),
+    };
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::set_directory_visibility(&conn, authenticated_device, req.directory_visible) {
+        Ok(()) => ok(200, json!({ "directory_visible": req.directory_visible })),
+        Err(DbError::DeviceNotFound) => error(404, "device_not_found", "authenticated device not found"),
+        Err(_) => error(500, "internal_error", "privacy setting update failed"),
     }
 }
 
@@ -607,6 +642,14 @@ fn handle_send(state: &AppState, body: &str, authenticated_sender: &str) -> (u16
     };
 
     let conn = state.db.lock().expect("db mutex poisoned");
+    let sender_active = conn.query_row(
+        "SELECT u.status = 'active' FROM users u JOIN devices d ON d.user_id = u.user_id WHERE d.device_id = ?1",
+        rusqlite::params![authenticated_sender],
+        |row| row.get::<_, bool>(0),
+    ).unwrap_or(false);
+    if !sender_active {
+        return error(403, "forbidden", "authenticated device is not active");
+    }
     match db::enqueue_message(&conn, &envelope) {
         Ok(message_id) => ok(
             202,
@@ -714,7 +757,7 @@ fn handle_attachment_create(state: &AppState, body: &str, authenticated_device: 
     match db::create_attachment(&conn, authenticated_device, req.opaque_size) {
         Ok(slot) => ok(
             201,
-            json!({ "attachment_id": slot.attachment_id, "storage_key": slot.storage_key }),
+            json!({ "attachment_id": slot.attachment_id, "capability": slot.capability }),
         ),
         Err(_) => error(500, "internal_error", "attachment slot creation failed"),
     }
@@ -801,7 +844,7 @@ fn handle_attachment_upload(
     }
 }
 
-fn handle_attachment_download(state: &AppState, attachment_id: &str, _authenticated_device: &str) -> (u16, Vec<u8>) {
+fn handle_attachment_download(state: &AppState, attachment_id: &str, _authenticated_device: &str, capability: Option<&str>) -> (u16, Vec<u8>) {
     if DeviceId::from_hex(attachment_id).is_none() {
         return (400, b"invalid attachment id".to_vec());
     }
@@ -815,6 +858,12 @@ fn handle_attachment_download(state: &AppState, attachment_id: &str, _authentica
     };
     if record.expires_at <= current_unix_seconds() {
         return (410, b"attachment expired".to_vec());
+    }
+    let Some(capability) = capability else {
+        return (403, b"attachment capability required".to_vec());
+    };
+    if !db::attachment_capability_matches(&record, capability) {
+        return (403, b"invalid attachment capability".to_vec());
     }
     if !record.uploaded {
         return (404, b"attachment blob not available".to_vec());

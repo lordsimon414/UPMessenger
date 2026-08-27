@@ -54,6 +54,7 @@ enum ChatPayload {
         filename: String,
         size: u64,
         key: [u8; 32],
+        capability: String,
     },
 }
 
@@ -180,6 +181,12 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+fn fingerprint_hex(identity_public_key: &[u8; 32]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(identity_public_key);
+    digest.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().chunks(8).map(|c| String::from_utf8_lossy(c).to_string()).collect::<Vec<_>>().join(" ")
+}
+
 pub struct UpmApp {
     profile: LocalProfile,
     identity: LocalIdentity,
@@ -191,6 +198,7 @@ pub struct UpmApp {
     conversation: Option<Conversation>,
     local_store: Option<LocalStore>,
     last_poll: f64,
+    directory_visible: bool,
 }
 
 impl UpmApp {
@@ -213,6 +221,7 @@ impl UpmApp {
             conversation: None,
             local_store,
             last_poll: 0.0,
+            directory_visible: true,
         }
     }
 
@@ -289,6 +298,29 @@ impl UpmApp {
             }
             Err(e) => self.status = format!("Authentication failed: {e}"),
         }
+    }
+
+    fn update_directory_visibility(&mut self) {
+        let Some(token) = self.profile.session_token.clone() else { return; };
+        let Some(api) = self.api.clone() else { return; };
+        match api.set_directory_visibility(&token, self.directory_visible) {
+            Ok(()) => self.status = if self.directory_visible { "Directory visibility enabled" } else { "Directory visibility disabled" }.into(),
+            Err(e) => self.status = format!("Privacy setting failed: {e}"),
+        }
+    }
+
+    fn logout(&mut self) {
+        let token = self.profile.session_token.clone();
+        let Some(api) = self.api.clone() else { return; };
+        if let Some(token) = token {
+            match api.logout(&token) {
+                Ok(()) => self.status = "Logged out".into(),
+                Err(e) => self.status = format!("Logout failed: {e}"),
+            }
+        }
+        self.profile.session_token = None;
+        self.profile.session_expires_at = None;
+        let _ = storage::save(&self.profile);
     }
 
     fn resolve(&mut self) {
@@ -429,13 +461,13 @@ impl UpmApp {
         let ciphertext_size = size.checked_add(attachments::NONCE_LEN as u64 + 16).ok_or_else(|| "attachment size overflow".to_string())?;
         let api = self.api.clone().ok_or_else(|| "Invalid server URL".to_string())?;
         let token = self.profile.session_token.clone().ok_or_else(|| "Authenticate first".to_string())?;
-        let attachment_id = api.create_attachment(&token, ciphertext_size as i64).map_err(|e| format!("attachment slot failed: {e}"))?;
+        let (attachment_id, capability) = api.create_attachment(&token, ciphertext_size as i64).map_err(|e| format!("attachment slot failed: {e}"))?;
         let id = MessageId::from_hex(&attachment_id).ok_or_else(|| "server returned invalid attachment id".to_string())?;
         let blob = attachments::encrypt(key, id, &plaintext).map_err(|e| e.to_string())?;
         if blob.len() as u64 != ciphertext_size { return Err("attachment ciphertext size mismatch".into()); }
         api.upload_attachment_blob(&token, &attachment_id, &blob).map_err(|e| format!("attachment upload failed: {e}"))?;
         let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("attachment").to_string();
-        let payload = ChatPayload::Attachment { attachment_id: id, filename: filename.clone(), size, key: key.0 };
+        let payload = ChatPayload::Attachment { attachment_id: id, filename: filename.clone(), size, key: key.0, capability };
         self.send_payload(payload, format!("📎 {filename} ({size} bytes)"));
         Ok(())
     }
@@ -507,9 +539,9 @@ impl UpmApp {
             let payload = match serde_json::from_slice::<ChatPayload>(&plaintext) { Ok(v) => v, Err(_) => { self.status = "Decrypted payload has unsupported format".into(); continue; } };
             let display = match payload {
                 ChatPayload::Text(text) => text,
-                ChatPayload::Attachment { attachment_id, filename, size, key } => {
+                ChatPayload::Attachment { attachment_id, filename, size, key, capability } => {
                     let path = PathBuf::from(&filename);
-                    match api.download_attachment_blob(&token, &attachment_id.to_hex()) {
+                    match api.download_attachment_blob(&token, &attachment_id.to_hex(), &capability) {
                         Ok(blob) => match attachments::decrypt(attachments::AttachmentKey(key), attachment_id, &blob) {
                             Ok(data) => {
                                 let safe_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("attachment.bin");
@@ -572,7 +604,17 @@ impl eframe::App for UpmApp {
             ui.text_edit_singleline(&mut self.profile.username);
             if let Some(id) = &self.profile.upm_id { ui.label(format!("UPM ID: {id}")); }
             if let Some(d) = &self.profile.device_id { ui.small(format!("Device: {d}")); }
-            ui.horizontal(|ui| { if ui.button("Register").clicked() { self.register(); } if ui.button("Authenticate").clicked() { self.authenticate(); } });
+            ui.horizontal(|ui| { if ui.button("Register").clicked() { self.register(); } if ui.button("Authenticate").clicked() { self.authenticate(); } if ui.button("Log out").clicked() { self.logout(); } });
+            if self.profile.session_token.is_some() {
+                ui.small(format!("Protocol: v{}", ProtocolVersion::CURRENT.0));
+                if let Some(expires) = self.profile.session_expires_at { ui.small(format!("Session expires: {expires}")); }
+            }
+            let identity_pub = self.identity.signing.public_key();
+            ui.small(format!("Identity fingerprint: {}", fingerprint_hex(&identity_pub)));
+            if self.profile.session_token.is_some() {
+                let response = ui.checkbox(&mut self.directory_visible, "Discoverable in directory");
+                if response.changed() { self.update_directory_visibility(); }
+            }
             ui.separator();
             ui.heading("Contact");
             ui.horizontal(|ui| { ui.text_edit_singleline(&mut self.new_contact); if ui.button("Resolve").clicked() { self.resolve(); } });

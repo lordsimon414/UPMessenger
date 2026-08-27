@@ -6,6 +6,7 @@ members = [
     "crates/upm-core",
     "server/upm-server",
     "clients/upm-windows",
+    "tools/upm-smoke",
 ]
 
 # Shared metadata / lint policy for the whole workspace.

@@ -1,0 +1,13 @@
+[package]
+name = "upm-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Wire format, envelope types and protocol version negotiation for UPM (SRS §6, §16)."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rand = "0.8"

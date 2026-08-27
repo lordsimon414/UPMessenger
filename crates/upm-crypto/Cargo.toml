@@ -1,0 +1,30 @@
+[package]
+name = "upm-crypto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Cryptographic primitive boundary for UPM (SRS §6). Wraps established, maintained libraries only — no home-grown cipher/KDF/signature/ratchet primitives (SEC-02)."
+
+[dependencies]
+thiserror.workspace = true
+ed25519-dalek = { version = "=2.1.1", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Pinned only to constrain transitive resolution: newer zeroize_derive
+# releases require Cargo's edition2024 feature, which is unavailable on
+# this toolchain (cargo 1.75). We don't call zeroize directly (see the
+# manual Drop impl on AeadKey below) — this pin exists purely so
+# ed25519-dalek/x25519-dalek's own optional zeroize dependency resolves to
+# a version old enough to build. Remove once the build toolchain is
+# upgraded past cargo/rustc with edition2024 support.
+zeroize = "=1.7.0"
+zeroize_derive = "=1.4.3"
+# Transitive via ed25519 -> pkcs8 -> spki (only version-resolved, not
+# actually compiled in since we don't enable the "pkcs8" feature) — pinned
+# for the same edition2024/cargo-1.75 reason as zeroize above.
+base64ct = "=1.6.0"
+

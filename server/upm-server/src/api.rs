@@ -1,0 +1,614 @@
+//! HTTP API surface (SRS §16). Endpoint names/shapes are illustrative
+//! contracts per the SRS ("the implementation MAY choose equivalent RPC
+//! names provided semantics remain identical") — this is a straightforward
+//! Phase 1 realization of them.
+//!
+//! Every handler returns JSON and never reflects back sensitive input in
+//! error messages (SRS §16: "Server errors SHALL avoid reflecting
+//! sensitive input").
+//!
+//! # Authentication
+//! Registration, directory resolution and public profile lookups are
+//! intentionally open (that's the point of a directory). Everything that
+//! acts on behalf of a specific device — sending, pulling, acking,
+//! attachment slots, adding a new device key — requires a bearer session
+//! token obtained via `/v1/auth/challenge` + `/v1/auth/verify` (see
+//! `auth.rs`). Pull/ack are further restricted to the authenticated
+//! device's own queue.
+
+use crate::auth::{self, AuthError};
+use crate::db::{self, DbError};
+use crate::util::{base64_decode, base64_encode, decode_fixed};
+use rusqlite::Connection;
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tiny_http::{Header, Method, Request, Response};
+use upm_protocol::{DeviceId, MessageEnvelope, MessageId, ProtocolVersion};
+
+pub struct AppState {
+    pub db: Mutex<Connection>,
+}
+
+pub fn handle(state: &AppState, mut request: Request) {
+    let method = request.method().clone();
+    let url = request.url().to_string();
+    let bearer = extract_bearer(&request);
+    let mut body = String::new();
+    let _ = request.as_reader().read_to_string(&mut body);
+
+    let (status, json_body) = route(state, &method, &url, &body, bearer.as_deref());
+
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+        .expect("static header is valid");
+    let response = Response::from_string(json_body)
+        .with_status_code(status)
+        .with_header(header);
+    let _ = request.respond(response);
+}
+
+fn extract_bearer(request: &Request) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| {
+            h.field
+                .as_str()
+                .as_str()
+                .eq_ignore_ascii_case("Authorization")
+        })
+        .and_then(|h| {
+            let v = h.value.as_str();
+            v.strip_prefix("Bearer ").map(|s| s.trim().to_string())
+        })
+}
+
+/// Resolves the bearer token (if any) to an authenticated device_id, or an
+/// error response ready to return. Handlers that require auth call this
+/// first and propagate the `Err` variant directly.
+fn require_auth(state: &AppState, bearer: Option<&str>) -> Result<String, (u16, String)> {
+    let token = bearer.ok_or_else(|| error(401, "unauthorized", "missing bearer session token"))?;
+    let conn = state.db.lock().expect("db mutex poisoned");
+    auth::authenticate(&conn, token)
+        .map_err(|_| error(401, "unauthorized", "invalid or expired session token"))
+}
+
+fn route(
+    state: &AppState,
+    method: &Method,
+    url: &str,
+    body: &str,
+    bearer: Option<&str>,
+) -> (u16, String) {
+    let path = url.split('?').next().unwrap_or("");
+    let segments: Vec<&str> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let seg: Vec<&str> = segments.iter().map(|s| *s).collect();
+
+    match (method, seg.as_slice()) {
+        // Open endpoints.
+        (Method::Post, ["v1", "account", "register"]) => handle_register(state, body),
+        (Method::Get, ["v1", "directory", "resolve", username]) => handle_resolve(state, username),
+        (Method::Get, ["v1", "profile", "public", username]) => {
+            handle_public_profile(state, username)
+        }
+        (Method::Post, ["v1", "auth", "challenge"]) => handle_auth_challenge(state, body),
+        (Method::Post, ["v1", "auth", "verify"]) => handle_auth_verify(state, body),
+
+        // Authenticated endpoints.
+        (Method::Get, ["v1", "devices", "keys", device_id]) => handle_get_device_keys(state, device_id),
+        (Method::Post, ["v1", "devices", "keys"]) => match require_auth(state, bearer) {
+            Ok(authenticated_device) => handle_publish_keys(state, body, &authenticated_device),
+            Err(e) => e,
+        },
+        (Method::Post, ["v1", "messages", "send"]) => match require_auth(state, bearer) {
+            Ok(sender_device) => handle_send(state, body, &sender_device),
+            Err(e) => e,
+        },
+        (Method::Get, ["v1", "messages", "pull"]) => match require_auth(state, bearer) {
+            Ok(authenticated_device) => handle_pull(state, url, &authenticated_device),
+            Err(e) => e,
+        },
+        (Method::Post, ["v1", "messages", "ack"]) => match require_auth(state, bearer) {
+            Ok(authenticated_device) => handle_ack(state, body, &authenticated_device),
+            Err(e) => e,
+        },
+        (Method::Post, ["v1", "attachments", "create"]) => match require_auth(state, bearer) {
+            Ok(authenticated_device) => handle_attachment_create(state, body, &authenticated_device),
+            Err(e) => e,
+        },
+        (Method::Delete, ["v1", "attachments", id]) => match require_auth(state, bearer) {
+            Ok(authenticated_device) => handle_attachment_delete(state, id, &authenticated_device),
+            Err(e) => e,
+        },
+
+        _ => error(404, "not_found", "no such endpoint"),
+    }
+}
+
+fn error(status: u16, code: &str, message: &str) -> (u16, String) {
+    (
+        status,
+        json!({ "error": { "code": code, "message": message } }).to_string(),
+    )
+}
+
+fn ok(status: u16, body: serde_json::Value) -> (u16, String) {
+    (status, body.to_string())
+}
+
+fn query_param<'a>(url: &'a str, key: &str) -> Option<&'a str> {
+    let query = url.split('?').nth(1)?;
+    for pair in query.split('&') {
+        let mut it = pair.splitn(2, '=');
+        if it.next() == Some(key) {
+            return it.next();
+        }
+    }
+    None
+}
+
+/// Validates that a client-supplied string is a base64-encoded 32-byte
+/// Ed25519 public key before it's ever stored (SRS §6 boundary discipline:
+/// garbage keys should fail loudly at the edge, not silently at first use).
+fn valid_public_key(candidate: &str) -> bool {
+    decode_fixed::<32>(candidate).is_some()
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------
+// POST /v1/account/register — AC-01
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RegisterRequest {
+    username: String,
+    identity_public_key: String,
+}
+
+fn handle_register(state: &AppState, body: &str) -> (u16, String) {
+    let req: RegisterRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return error(400, "bad_request", "invalid registration payload"),
+    };
+
+    if req.username.len() < 3 || req.username.len() > 32 {
+        return error(400, "invalid_username", "username must be 3-32 characters");
+    }
+    if !valid_public_key(&req.identity_public_key) {
+        return error(
+            400,
+            "invalid_key",
+            "identity_public_key must be a base64-encoded 32-byte Ed25519 key",
+        );
+    }
+
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::register_account(&conn, &req.username, &req.identity_public_key) {
+        Ok(acc) => ok(
+            201,
+            json!({ "user_id": acc.user_id, "upm_id": acc.upm_id, "device_id": acc.device_id }),
+        ),
+        Err(DbError::UsernameTaken) => {
+            error(409, "username_taken", "username is already registered")
+        }
+        Err(_) => error(500, "internal_error", "registration failed"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// GET /v1/directory/resolve/{username} — AC-02
+// ---------------------------------------------------------------------
+
+fn handle_resolve(state: &AppState, username: &str) -> (u16, String) {
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::resolve_username(&conn, username) {
+        Ok(Some(entry)) => ok(
+            200,
+            json!({ "upm_id": entry.upm_id, "username": entry.username, "device_id": entry.device_id, "identity_public_key": entry.identity_public_key }),
+        ),
+        Ok(None) => error(404, "not_found", "no such username"),
+        Err(_) => error(500, "internal_error", "resolve failed"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// POST /v1/auth/challenge, POST /v1/auth/verify
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ChallengeRequest {
+    device_id: String,
+}
+
+fn handle_auth_challenge(state: &AppState, body: &str) -> (u16, String) {
+    let req: ChallengeRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return error(400, "bad_request", "invalid challenge payload"),
+    };
+
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match auth::issue_challenge(&conn, &req.device_id) {
+        Ok(challenge) => ok(
+            200,
+            json!({ "challenge_base64": base64_encode(&challenge), "ttl_seconds": auth::CHALLENGE_TTL_SECONDS }),
+        ),
+        Err(AuthError::UnknownDevice) => error(404, "device_not_found", "unknown device_id"),
+        Err(_) => error(500, "internal_error", "challenge issuance failed"),
+    }
+}
+
+#[derive(Deserialize)]
+struct VerifyRequest {
+    device_id: String,
+    signature_base64: String,
+}
+
+fn handle_auth_verify(state: &AppState, body: &str) -> (u16, String) {
+    let req: VerifyRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return error(400, "bad_request", "invalid verify payload"),
+    };
+
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match auth::verify_and_issue_session(&conn, &req.device_id, &req.signature_base64) {
+        Ok((token, expires_at)) => ok(
+            200,
+            json!({ "session_token": token, "expires_at": expires_at }),
+        ),
+        Err(AuthError::InvalidSignature) => {
+            error(401, "invalid_signature", "signature does not verify")
+        }
+        Err(AuthError::NoChallenge) => error(400, "no_challenge", "request a challenge first"),
+        Err(AuthError::ChallengeExpired) => error(
+            400,
+            "challenge_expired",
+            "challenge expired, request a new one",
+        ),
+        Err(AuthError::Malformed) => error(400, "bad_request", "malformed signature or stored key"),
+        Err(AuthError::UnknownDevice) => error(404, "device_not_found", "unknown device_id"),
+        Err(_) => error(500, "internal_error", "verification failed"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// POST /v1/devices/keys — refreshes the authenticated device's X3DH bundle.
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PublishKeysRequest {
+    identity_exchange_public: String,
+    signed_prekey_public: String,
+    signed_prekey_signature: String,
+}
+
+fn valid_fixed_key(candidate: &str) -> bool {
+    decode_fixed::<32>(candidate).is_some()
+}
+
+fn valid_signature(candidate: &str) -> bool {
+    decode_fixed::<64>(candidate).is_some()
+}
+
+
+fn handle_publish_keys(state: &AppState, body: &str, authenticated_device: &str) -> (u16, String) {
+    let req: PublishKeysRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return error(400, "bad_request", "invalid key payload"),
+    };
+    if !valid_fixed_key(&req.identity_exchange_public)
+        || !valid_fixed_key(&req.signed_prekey_public)
+        || !valid_signature(&req.signed_prekey_signature)
+    {
+        return error(400, "invalid_key_bundle", "invalid X3DH device key material");
+    }
+
+    let conn = state.db.lock().expect("db mutex poisoned");
+    let identity_public_key = match db::get_device_identity_public_key(&conn, authenticated_device) {
+        Ok(key) => key,
+        Err(DbError::DeviceNotFound) => return error(404, "device_not_found", "unknown authenticated device"),
+        Err(_) => return error(500, "internal_error", "key publication failed"),
+    };
+    let identity_public_key: [u8; 32] = match decode_fixed(&identity_public_key) {
+        Some(key) => key,
+        None => return error(500, "internal_error", "stored device identity key is invalid"),
+    };
+    let identity_exchange_public: [u8; 32] = match decode_fixed(&req.identity_exchange_public) {
+        Some(key) => key,
+        None => return error(400, "invalid_key_bundle", "invalid X3DH device key material"),
+    };
+    let signed_prekey_public: [u8; 32] = match decode_fixed(&req.signed_prekey_public) {
+        Some(key) => key,
+        None => return error(400, "invalid_key_bundle", "invalid X3DH device key material"),
+    };
+    let signature: [u8; 64] = match decode_fixed(&req.signed_prekey_signature) {
+        Some(sig) => sig,
+        None => return error(400, "invalid_key_bundle", "invalid X3DH device key material"),
+    };
+    let mut signed_message = [0u8; 64];
+    signed_message[..32].copy_from_slice(&identity_exchange_public);
+    signed_message[32..].copy_from_slice(&signed_prekey_public);
+    if upm_crypto::verify(&identity_public_key, &signed_message, &signature).is_err() {
+        return error(400, "invalid_key_bundle", "X3DH prekey signature does not match device identity");
+    }
+
+    match db::update_device_keys(
+        &conn,
+        authenticated_device,
+        &req.identity_exchange_public,
+        &req.signed_prekey_public,
+        &req.signed_prekey_signature,
+    ) {
+        Ok(()) => ok(200, json!({ "device_id": authenticated_device })),
+        Err(DbError::DeviceNotFound) => error(404, "device_not_found", "unknown authenticated device"),
+        Err(_) => error(500, "internal_error", "key publication failed"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// GET /v1/devices/keys/{device_id} — public X3DH bundle for session setup.
+// ---------------------------------------------------------------------
+
+fn handle_get_device_keys(state: &AppState, device_id: &str) -> (u16, String) {
+    let parsed = match DeviceId::from_hex(device_id) {
+        Some(id) => id,
+        None => return error(400, "invalid_device_id", "device_id must be 16 bytes encoded as 32 hex characters"),
+    };
+    let conn = state.db.lock().expect("db mutex poisoned");
+    let bundle = match db::get_device_prekey_bundle(&conn, &parsed.to_hex()) {
+        Ok(bundle) => bundle,
+        Err(DbError::DeviceNotFound) => return error(404, "device_not_found", "unknown device_id"),
+        Err(_) => return error(500, "internal_error", "key lookup failed"),
+    };
+    if bundle.identity_exchange_public.is_empty()
+        || bundle.signed_prekey_public.is_empty()
+        || bundle.signed_prekey_signature.is_empty()
+    {
+        return error(409, "keys_unavailable", "device has not published a complete X3DH key bundle");
+    }
+    ok(200, json!({
+        "device_id": bundle.device_id,
+        "identity_public_key": bundle.identity_public_key,
+        "identity_exchange_public": bundle.identity_exchange_public,
+        "signed_prekey_public": bundle.signed_prekey_public,
+        "signed_prekey_signature": bundle.signed_prekey_signature,
+    }))
+}
+
+// ---------------------------------------------------------------------
+// POST /v1/messages/send — AC-03..AC-06 depend on the client-side crypto
+// layer; this endpoint only relays the opaque envelope (SRS §8).
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SendRequest {
+    protocol_version: u16,
+    message_id: String,
+    recipient_device_id: String,
+    /// Base64-encoded ciphertext. The server does not and cannot decode
+    /// its meaning — only its validity as base64 is checked.
+    ciphertext_base64: String,
+    ttl_seconds: Option<i64>,
+}
+
+
+
+fn handle_send(state: &AppState, body: &str, authenticated_sender: &str) -> (u16, String) {
+    let req: SendRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return error(400, "bad_request", "invalid envelope payload"),
+    };
+
+    if req.protocol_version != ProtocolVersion::CURRENT.0 {
+        return error(426, "unsupported_protocol", "unsupported protocol version");
+    }
+    let message_id = match MessageId::from_hex(&req.message_id) {
+        Some(id) => id,
+        None => return error(400, "invalid_message_id", "message_id must be 16 random bytes encoded as 32 hex characters"),
+    };
+    let recipient_device_id = match DeviceId::from_hex(&req.recipient_device_id) {
+        Some(id) => id,
+        None => return error(400, "invalid_device_id", "recipient_device_id must be 16 random bytes encoded as 32 hex characters"),
+    };
+
+    let ciphertext = match base64_decode(&req.ciphertext_base64) {
+        Some(bytes) => bytes,
+        None => {
+            return error(
+                400,
+                "bad_ciphertext",
+                "ciphertext_base64 is not valid base64",
+            )
+        }
+    };
+
+    let server_timestamp = current_unix_seconds();
+    let ttl = req.ttl_seconds.unwrap_or(db::DEFAULT_MESSAGE_TTL_SECONDS);
+    if ttl <= 0 || ttl > db::DEFAULT_MESSAGE_TTL_SECONDS {
+        return error(400, "invalid_ttl", "ttl_seconds is outside the allowed retention window");
+    }
+    let sender_device_id = match DeviceId::from_hex(authenticated_sender) {
+        Some(id) => id,
+        None => return error(500, "internal_error", "authenticated device identity is invalid"),
+    };
+    let envelope = MessageEnvelope {
+        protocol_version: ProtocolVersion(req.protocol_version),
+        message_id,
+        sender_device_id,
+        recipient_device_id,
+        ciphertext,
+        server_timestamp,
+        expires_at: server_timestamp.saturating_add(ttl as u64),
+    };
+
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::enqueue_message(&conn, &envelope) {
+        Ok(message_id) => ok(
+            202,
+            json!({
+                "protocol_version": req.protocol_version,
+                "message_id": message_id,
+                "server_timestamp": server_timestamp,
+                "expires_at": envelope.expires_at,
+            }),
+        ),
+        Err(DbError::DeviceNotFound) => {
+            error(404, "device_not_found", "unknown recipient_device_id")
+        }
+        Err(_) => error(500, "internal_error", "send failed"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// GET /v1/messages/pull?device_id=... — restricted to the authenticated
+// device's own queue.
+// ---------------------------------------------------------------------
+
+fn handle_pull(state: &AppState, url: &str, authenticated_device: &str) -> (u16, String) {
+    let requested_device = match query_param(url, "device_id") {
+        Some(d) => d,
+        None => return error(400, "bad_request", "device_id query parameter is required"),
+    };
+    if requested_device != authenticated_device {
+        return error(403, "forbidden", "cannot pull another device's queue");
+    }
+
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::pull_messages(&conn, authenticated_device) {
+        Ok(envelopes) => {
+            let items: Vec<_> = envelopes
+                .into_iter()
+                .map(|e| {
+                    json!({
+                        "message_id": e.message_id,
+                        "sender_device_id": e.sender_device_id,
+                        "ciphertext_base64": base64_encode(&e.ciphertext_blob),
+                        "created_at": e.created_at,
+                        "expires_at": e.expires_at,
+                        "protocol_version": e.protocol_version,
+                    })
+                })
+                .collect();
+            ok(200, json!({ "envelopes": items }))
+        }
+        Err(_) => error(500, "internal_error", "pull failed"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// POST /v1/messages/ack — only the authenticated recipient device may
+// acknowledge/delete its queued message IDs.
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AckRequest {
+    message_ids: Vec<String>,
+}
+
+fn handle_ack(state: &AppState, body: &str, authenticated_device: &str) -> (u16, String) {
+    let req: AckRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return error(400, "bad_request", "invalid ack payload"),
+    };
+
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::ack_messages(&conn, authenticated_device, &req.message_ids) {
+        Ok(count) => ok(200, json!({ "acknowledged": count })),
+        Err(_) => error(500, "internal_error", "ack failed"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// POST /v1/attachments/create, DELETE /v1/attachments/{id} — SRS §9
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateAttachmentRequest {
+    opaque_size: i64,
+}
+
+/// Server-configured attachment size ceiling (SRS §9: "Initial recommended
+/// attachment limit: 100 MB; configurable server-side").
+const MAX_ATTACHMENT_BYTES: i64 = 100 * 1024 * 1024;
+
+fn handle_attachment_create(state: &AppState, body: &str, authenticated_device: &str) -> (u16, String) {
+    let req: CreateAttachmentRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return error(400, "bad_request", "invalid attachment payload"),
+    };
+
+    if req.opaque_size <= 0 || req.opaque_size > MAX_ATTACHMENT_BYTES {
+        return error(
+            400,
+            "attachment_too_large",
+            "opaque_size exceeds server limit",
+        );
+    }
+
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::create_attachment(&conn, authenticated_device, req.opaque_size) {
+        Ok(slot) => ok(
+            201,
+            json!({ "attachment_id": slot.attachment_id, "storage_key": slot.storage_key }),
+        ),
+        Err(_) => error(500, "internal_error", "attachment slot creation failed"),
+    }
+}
+
+fn handle_attachment_delete(state: &AppState, attachment_id: &str, authenticated_device: &str) -> (u16, String) {
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::delete_attachment(&conn, authenticated_device, attachment_id) {
+        Ok(true) => ok(200, json!({ "deleted": true })),
+        Ok(false) => error(404, "not_found", "no such attachment"),
+        Err(_) => error(500, "internal_error", "attachment deletion failed"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// GET /v1/profile/public/{username}
+// ---------------------------------------------------------------------
+
+fn handle_public_profile(state: &AppState, username: &str) -> (u16, String) {
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::get_public_profile(&conn, username) {
+        Ok(Some(entry)) => ok(
+            200,
+            json!({ "username": entry.username, "upm_id": entry.upm_id }),
+        ),
+        Ok(None) => error(404, "not_found", "no such username"),
+        Err(_) => error(500, "internal_error", "profile lookup failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_param_extracts_value() {
+        assert_eq!(
+            query_param("/v1/messages/pull?device_id=abc123", "device_id"),
+            Some("abc123")
+        );
+        assert_eq!(query_param("/v1/messages/pull", "device_id"), None);
+    }
+
+    #[test]
+    fn valid_public_key_checks_length() {
+        let good = base64_encode(&[1u8; 32]);
+        let bad = base64_encode(&[1u8; 20]);
+        assert!(valid_public_key(&good));
+        assert!(!valid_public_key(&bad));
+        assert!(!valid_public_key("not base64 at all!!"));
+    }
+}

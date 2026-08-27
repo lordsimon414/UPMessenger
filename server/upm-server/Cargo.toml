@@ -1,0 +1,18 @@
+[package]
+name = "upm-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "UPM delivery server (Windows 11 target, SRS §10). Phase 1: account directory, device keys, message queue, minimal attachment metadata on SQLite."
+
+[dependencies]
+upm-protocol = { path = "../../crates/upm-protocol" }
+upm-crypto = { path = "../../crates/upm-crypto" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
+tiny_http = "0.12"
+rand = "0.8"
+sha2 = "0.10"

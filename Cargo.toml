@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/upm-protocol",
+    "crates/upm-crypto",
+    "crates/upm-core",
+    "server/upm-server",
+    "clients/upm-windows",
+]
+
+# Shared metadata / lint policy for the whole workspace.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["GAC-Studio"]
+license = "Proprietary"
+repository = "https://example.invalid/gac-studio/upm"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+# Foundation-phase lint policy (SRS §6/§19: no ad-hoc unsafe crypto, no silent
+# panics in library code). Individual crates may tighten further.
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -1,0 +1,14 @@
+[package]
+name = "upm-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Session/ratchet layer boundary for UPM. Consumes upm-crypto primitives and upm-protocol envelopes; the ratchet implementation itself is Phase 2 (SRS §23)."
+
+[dependencies]
+upm-crypto = { path = "../upm-crypto" }
+upm-protocol = { path = "../upm-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

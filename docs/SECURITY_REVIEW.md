@@ -4,6 +4,9 @@ This review compares the repository implementation with UPM SRS 1.1 and records 
 
 ## Fixed in this update
 
+- **Rate limiting:** a coarse per-client-IP limiter (120 req/10s, preferring the `CF-Connecting-IP` header set by Cloudflare Tunnel over the raw TCP peer address) applies to every request; `/v1/account/register` (5/5min) and `/v1/auth/challenge`+`/v1/auth/verify` (20/5min, keyed by `device_id` rather than IP so a shared tunnel IP can't be used to spread brute-force attempts across many target accounts) have tighter, endpoint-specific limits. Fixed-window counters, bounded to 10k tracked keys to prevent unbounded memory growth from key-cycling.
+- **Access logging:** every request now logs a timestamp, method, path, and status code to stdout. Deliberately omits query strings, client IP, and body content (SRS §13 metadata-minimization) — usernames, device IDs, and session tokens never reach the log.
+
 - **Transactional ratchet decryption:** failed or tampered messages are processed against cloned candidate state. Ratchet/DH/skipped-key state is committed only after AEAD authentication succeeds.
 - **Recipient-scoped ACKs:** message acknowledgement/deletion is authorized by the authenticated recipient device, so one device cannot delete another device's queued ciphertext by message ID alone.
 - **Authenticated device key refresh:** `/v1/devices/keys` now updates only the authenticated device and requires an X25519 identity-exchange key, signed prekey, and Ed25519 signature.
@@ -24,6 +27,8 @@ This review compares the repository implementation with UPM SRS 1.1 and records 
 - The server is still a console binary rather than a Windows service.
 - TLS/public deployment is still external to the server process; the intended deployment remains the SRS localhost + outbound tunnel model.
 - Attachment capabilities are now implemented, but full attachment UX, thumbnail encryption, and broader attachment interoperability remain outstanding.
+- Rate limiting is in-memory and per-process: it resets on restart and does not survive/coordinate across multiple server instances (not a concern for the single-node deployment this SRS targets, but worth flagging if that assumption ever changes).
+- No structured/leveled logging or metrics export (current logging is plain stdout lines, not JSON, and there's no request-tracing ID); fine for a single small deployment, a real production rollout would likely want both.
 - Queue/disk quotas, fuzz/property tests, persistence/restart tests, privacy-log verification, cross-platform interoperability, and independent security review remain outstanding.
 
 Before wider real-world use, follow the SRS release gate: known critical findings must be fixed and residual risk explicitly accepted, with an independent security review of the protocol/key-management design.

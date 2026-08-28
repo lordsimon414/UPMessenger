@@ -32,14 +32,59 @@ use upm_protocol::{DeviceId, MessageEnvelope, MessageId, ProtocolVersion};
 pub struct AppState {
     pub db: Mutex<Connection>,
     pub attachment_dir: PathBuf,
+    pub ip_limiter: crate::ratelimit::RateLimiter,
+    pub register_limiter: crate::ratelimit::RateLimiter,
+    pub auth_limiter: crate::ratelimit::RateLimiter,
+}
+
+/// Identifies the caller for rate-limiting purposes. Prefers the
+/// `CF-Connecting-IP` header set by Cloudflare Tunnel (SRS §10.1's
+/// deployment model) since, behind that tunnel, `remote_addr()` is just
+/// the tunnel's local connection and doesn't distinguish real clients.
+/// Falls back to the raw peer address for direct/local access (e.g. during
+/// development, or the `upm-smoke` tool hitting the server directly).
+fn client_key(request: &Request) -> String {
+    let header = request
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("CF-Connecting-IP"))
+        .map(|h| h.value.as_str().trim().to_string());
+    if let Some(ip) = header {
+        if !ip.is_empty() {
+            return ip;
+        }
+    }
+    request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Minimal, dependency-free access log: timestamp (Unix seconds), method,
+/// path, status. Deliberately omits query strings, client IP, and body
+/// content — those can carry usernames, device IDs, or tokens, and the
+/// project's stated metadata-minimization stance (SRS §13) argues against
+/// logging more than needed to see the server is behaving. Correlate with
+/// `CF-Connecting-IP`/tunnel-level logs if per-client debugging is ever
+/// needed for abuse investigation.
+fn log_line(method: &Method, path: &str, status: u16) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    println!("{now} {method:?} {path} {status}");
 }
 
 pub fn handle(state: &AppState, mut request: Request) {
     let method = request.method().clone();
     let url = request.url().to_string();
     let bearer = extract_bearer(&request);
+    let key = client_key(&request);
     let path = url.split('?').next().unwrap_or("");
     let segments: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+
+    if !state.ip_limiter.check(&key) {
+        log_line(&method, path, 429);
+        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
+        let response = Response::from_string(error(429, "rate_limited", "too many requests, slow down").1)
+            .with_status_code(429).with_header(header);
+        let _ = request.respond(response);
+        return;
+    }
 
     if segments.len() == 4 && segments[0] == "v1" && segments[1] == "attachments" && segments[3] == "blob" {
         let auth_result = require_auth(state, bearer.as_deref());
@@ -53,10 +98,12 @@ pub fn handle(state: &AppState, mut request: Request) {
                     Method::Get => handle_attachment_download(state, &segments[2].to_ascii_uppercase(), &device_id, capability.as_deref()),
                     _ => (405, Vec::new()),
                 };
+                log_line(&method, path, result.0);
                 let response = Response::from_data(result.1).with_status_code(result.0);
                 let _ = request.respond(response);
             }
             Err((status, body)) => {
+                log_line(&method, path, status);
                 let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
                 let response = Response::from_string(body).with_status_code(status).with_header(header);
                 let _ = request.respond(response);
@@ -68,6 +115,7 @@ pub fn handle(state: &AppState, mut request: Request) {
     const MAX_JSON_BODY_BYTES: u64 = 2 * 1024 * 1024;
     let mut raw_body = Vec::new();
     if request.as_reader().take(MAX_JSON_BODY_BYTES + 1).read_to_end(&mut raw_body).is_err() {
+        log_line(&method, path, 400);
         let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
         let response = Response::from_string(error(400, "bad_request", "request body could not be read").1)
             .with_status_code(400).with_header(header);
@@ -75,6 +123,7 @@ pub fn handle(state: &AppState, mut request: Request) {
         return;
     }
     if raw_body.len() as u64 > MAX_JSON_BODY_BYTES {
+        log_line(&method, path, 413);
         let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
         let response = Response::from_string(error(413, "request_too_large", "request body exceeds limit").1)
             .with_status_code(413).with_header(header);
@@ -84,6 +133,7 @@ pub fn handle(state: &AppState, mut request: Request) {
     let body = match String::from_utf8(raw_body) {
         Ok(body) => body,
         Err(_) => {
+            log_line(&method, path, 400);
             let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
             let response = Response::from_string(error(400, "bad_request", "request body must be UTF-8 JSON").1)
                 .with_status_code(400).with_header(header);
@@ -92,7 +142,8 @@ pub fn handle(state: &AppState, mut request: Request) {
         }
     };
 
-    let (status, json_body) = route(state, &method, &url, &body, bearer.as_deref());
+    let (status, json_body) = route(state, &method, &url, &body, bearer.as_deref(), &key);
+    log_line(&method, path, status);
 
     let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
         .expect("static header is valid");
@@ -134,6 +185,7 @@ fn route(
     url: &str,
     body: &str,
     bearer: Option<&str>,
+    client_key: &str,
 ) -> (u16, String) {
     let path = url.split('?').next().unwrap_or("");
     let segments: Vec<&str> = path
@@ -145,14 +197,29 @@ fn route(
 
     match (method, seg.as_slice()) {
         // Open endpoints.
-        (Method::Post, ["v1", "account", "register"]) => handle_register(state, body),
+        (Method::Post, ["v1", "account", "register"]) => {
+            if !state.register_limiter.check(client_key) {
+                return error(429, "rate_limited", "too many registration attempts, try again later");
+            }
+            handle_register(state, body)
+        }
         (Method::Get, ["v1", "directory", "resolve", username]) => handle_resolve(state, username),
         (Method::Get, ["v1", "directory", "resolve-id", upm_id]) => handle_resolve_upm_id(state, upm_id),
         (Method::Get, ["v1", "profile", "public", username]) => {
             handle_public_profile(state, username)
         }
-        (Method::Post, ["v1", "auth", "challenge"]) => handle_auth_challenge(state, body),
-        (Method::Post, ["v1", "auth", "verify"]) => handle_auth_verify(state, body),
+        (Method::Post, ["v1", "auth", "challenge"]) => {
+            if !state.auth_limiter.check(&auth_rate_limit_key(body)) {
+                return error(429, "rate_limited", "too many auth attempts, try again later");
+            }
+            handle_auth_challenge(state, body)
+        }
+        (Method::Post, ["v1", "auth", "verify"]) => {
+            if !state.auth_limiter.check(&auth_rate_limit_key(body)) {
+                return error(429, "rate_limited", "too many auth attempts, try again later");
+            }
+            handle_auth_verify(state, body)
+        }
         (Method::Delete, ["v1", "auth", "session"]) => match require_auth(state, bearer) {
             Ok(_) => handle_logout(state, bearer.unwrap_or("")),
             Err(e) => e,
@@ -199,6 +266,17 @@ fn route(
 
         _ => error(404, "not_found", "no such endpoint"),
     }
+}
+
+/// Extracts `device_id` from an auth-challenge/verify JSON body for
+/// rate-limit keying, without needing to fully typed-parse the request
+/// twice. Malformed bodies still get *a* key (so they're bucketed and
+/// rate-limited together) rather than bypassing the limiter outright.
+fn auth_rate_limit_key(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("device_id").and_then(|d| d.as_str()).map(|s| s.to_string()))
+        .unwrap_or_else(|| "malformed".to_string())
 }
 
 fn error(status: u16, code: &str, message: &str) -> (u16, String) {

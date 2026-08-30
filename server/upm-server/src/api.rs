@@ -837,6 +837,12 @@ fn handle_attachment_create(state: &AppState, body: &str, authenticated_device: 
             201,
             json!({ "attachment_id": slot.attachment_id, "capability": slot.capability }),
         ),
+        Err(DbError::AttachmentQuotaExceeded) => error(
+            507,
+            "attachment_quota_exceeded",
+            "this device's total attachment storage quota is exhausted; delete old attachments first",
+        ),
+        Err(DbError::DeviceNotFound) => error(404, "device_not_found", "unknown device"),
         Err(_) => error(500, "internal_error", "attachment slot creation failed"),
     }
 }

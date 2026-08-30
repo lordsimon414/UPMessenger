@@ -93,19 +93,19 @@ impl LocalStore {
         })
     }
 
-    pub fn load_messages(&self, peer: &str) -> Result<Vec<(bool, String)>, LocalStoreError> {
+    pub fn load_messages(&self, peer: &str) -> Result<Vec<(bool, String, i64)>, LocalStoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT direction, encrypted_text FROM messages WHERE peer_device_id = ?1 ORDER BY id ASC",
+            "SELECT direction, encrypted_text, created_at FROM messages WHERE peer_device_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![peer], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (direction, blob) = row?;
+            let (direction, blob, created_at) = row?;
             let plaintext = self.decrypt_record(&blob)?;
             let stored: StoredMessage = serde_json::from_slice(&plaintext)?;
-            out.push((direction == 1, stored.text));
+            out.push((direction == 1, stored.text, created_at));
         }
         Ok(out)
     }

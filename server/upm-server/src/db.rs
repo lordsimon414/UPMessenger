@@ -201,6 +201,8 @@ pub enum DbError {
     InvalidEnvelope,
     #[error("message queue quota exceeded")]
     QueueQuotaExceeded,
+    #[error("attachment storage quota exceeded for this device")]
+    AttachmentQuotaExceeded,
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -517,13 +519,26 @@ pub fn claim_one_time_prekey(
 // ---------------------------------------------------------------------
 // Maintenance (SRS §17/§18 bounded retention)
 // ---------------------------------------------------------------------
-pub fn reap_expired(conn: &Connection) -> Result<(), DbError> {
+/// Deletes expired messages, attachments, auth challenges, and sessions,
+/// returning the `storage_key`s of every attachment row it deleted *before*
+/// deleting them, so the caller (which owns `attachment_dir`, a filesystem
+/// concern this DB-only module doesn't know about) can unlink the
+/// corresponding blob files. Without that, an attachment that simply
+/// expires — rather than being explicitly deleted via
+/// `DELETE /v1/attachments/{id}` — would leave its blob file on disk
+/// forever.
+pub fn reap_expired_with_attachment_keys(conn: &Connection) -> Result<Vec<String>, DbError> {
     let now_ts = now();
+    let storage_keys: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT storage_key FROM attachments WHERE expires_at <= ?1")?;
+        let rows = stmt.query_map(params![now_ts], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
     conn.execute("DELETE FROM message_envelopes WHERE expires_at <= ?1", params![now_ts])?;
     conn.execute("DELETE FROM attachments WHERE expires_at <= ?1", params![now_ts])?;
     conn.execute("DELETE FROM auth_challenges WHERE expires_at <= ?1", params![now_ts])?;
     conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now_ts])?;
-    Ok(())
+    Ok(storage_keys)
 }
 
 // ---------------------------------------------------------------------
@@ -701,6 +716,13 @@ pub fn attachment_capability_matches(record: &AttachmentRecord, capability: &str
 
 pub const DEFAULT_ATTACHMENT_TTL_SECONDS: i64 = 30 * 24 * 3600;
 
+/// Cumulative cap on non-expired attachment bytes a single device may have
+/// reserved/uploaded at once. Independent of the per-upload size cap in
+/// api.rs (`MAX_ATTACHMENT_BYTES`), which only bounds a single request —
+/// this bounds the total across every attachment the device owns.
+pub const MAX_DEVICE_ATTACHMENT_BYTES: i64 = 500 * 1024 * 1024;
+
+#[derive(Debug)]
 pub struct AttachmentSlot {
     pub attachment_id: String,
     pub storage_key: String,
@@ -725,6 +747,22 @@ pub fn create_attachment(
     if exists.is_none() {
         return Err(DbError::DeviceNotFound);
     }
+
+    // Cumulative per-device storage quota (SRS §9 follow-up: without this,
+    // a device could create arbitrarily many slots — each individually
+    // under the per-upload size cap enforced in api.rs — and exhaust disk
+    // space). Counts every non-expired slot this device owns, uploaded or
+    // still-pending, since a pending slot is still a real reservation of
+    // intended storage.
+    let committed_bytes: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(opaque_size), 0) FROM attachments WHERE owner_device_id = ?1 AND expires_at > ?2",
+        params![owner_device_id, now()],
+        |row| row.get(0),
+    )?;
+    if committed_bytes.saturating_add(opaque_size) > MAX_DEVICE_ATTACHMENT_BYTES {
+        return Err(DbError::AttachmentQuotaExceeded);
+    }
+
     let attachment_id = random_hex(16);
     let storage_key = random_hex(24);
     let capability = random_hex(32);
@@ -801,6 +839,7 @@ mod tests {
     fn mem_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
+        crate::auth::init_schema(&conn).unwrap();
         conn
     }
 
@@ -836,6 +875,54 @@ mod tests {
         register_account(&conn, "max", "k1").unwrap();
         let err = register_account(&conn, "Max", "k2").unwrap_err();
         assert!(matches!(err, DbError::UsernameTaken));
+    }
+
+    #[test]
+    fn data_survives_closing_and_reopening_the_same_database_file() {
+        // Unlike every other test in this module, this one deliberately
+        // does NOT use an in-memory connection: the whole point is to
+        // verify that data written before a process exit (or crash) is
+        // still there after `db::open()` is called again on the same
+        // file path, exactly as a server restart would do.
+        let dir = std::env::temp_dir().join(format!("upm-persist-test-{}", random_hex(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("test.sqlite3");
+        let db_path_str = db_path.to_str().unwrap();
+
+        let device_id = {
+            let conn = open(db_path_str).unwrap();
+            crate::auth::init_schema(&conn).unwrap();
+            let acc = register_account(&conn, "restarttest", "k").unwrap();
+            enqueue_message(
+                &conn,
+                &MessageEnvelope {
+                    protocol_version: ProtocolVersion::CURRENT,
+                    message_id: upm_protocol::MessageId::from_hex("00112233445566778899AABBCCDDEEFF").unwrap(),
+                    sender_device_id: upm_protocol::DeviceId::from_hex(&acc.device_id).unwrap(),
+                    recipient_device_id: upm_protocol::DeviceId::from_hex(&acc.device_id).unwrap(),
+                    ciphertext: b"still here after restart".to_vec(),
+                    server_timestamp: now() as u64,
+                    expires_at: (now() + 3600) as u64,
+                },
+            )
+            .unwrap();
+            acc.device_id
+            // `conn` is dropped here, closing the connection — this is
+            // the moment a real server restart would happen at.
+        };
+
+        // Reopen the *same* file as a fresh connection, simulating the
+        // server process having been restarted.
+        let reopened = open(db_path_str).unwrap();
+        let entry = resolve_username(&reopened, "restarttest").unwrap();
+        assert!(entry.is_some(), "account must survive a restart");
+
+        let pulled = pull_messages(&reopened, &device_id).unwrap();
+        assert_eq!(pulled.len(), 1, "queued message must survive a restart");
+        assert_eq!(pulled[0].ciphertext_blob, b"still here after restart");
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -940,6 +1027,37 @@ mod tests {
     }
 
     #[test]
+    fn attachment_creation_is_rejected_once_device_quota_is_exhausted() {
+        let conn = mem_db();
+        let acc = register_account(&conn, "hoarder", "k").unwrap();
+
+        // Fill most of the quota with one big slot...
+        create_attachment(&conn, &acc.device_id, MAX_DEVICE_ATTACHMENT_BYTES - 100).unwrap();
+        // ...a second, small slot that still fits should succeed...
+        create_attachment(&conn, &acc.device_id, 50).unwrap();
+        // ...but a third slot that would push the device over the top must fail.
+        let err = create_attachment(&conn, &acc.device_id, 51).unwrap_err();
+        assert!(matches!(err, DbError::AttachmentQuotaExceeded));
+    }
+
+    #[test]
+    fn expired_attachments_do_not_count_against_the_quota() {
+        let conn = mem_db();
+        let acc = register_account(&conn, "recycler", "k").unwrap();
+
+        let old = create_attachment(&conn, &acc.device_id, MAX_DEVICE_ATTACHMENT_BYTES - 10).unwrap();
+        conn.execute(
+            "UPDATE attachments SET expires_at = ?1 WHERE attachment_id = ?2",
+            params![now() - 1, old.attachment_id],
+        )
+        .unwrap();
+
+        // The old slot has expired, so a new large slot should be allowed
+        // even though the (now-irrelevant) old one would have blown the budget.
+        create_attachment(&conn, &acc.device_id, MAX_DEVICE_ATTACHMENT_BYTES - 10).unwrap();
+    }
+
+    #[test]
     fn attachment_slot_lifecycle() {
         let conn = mem_db();
         let acc = register_account(&conn, "alice", "k").unwrap();
@@ -949,5 +1067,29 @@ mod tests {
         assert!(!attachment_capability_matches(&record, "wrong-capability"));
         assert!(delete_attachment(&conn, &acc.device_id, &slot.attachment_id).unwrap());
         assert!(!delete_attachment(&conn, &acc.device_id, &slot.attachment_id).unwrap());
+    }
+
+    #[test]
+    fn reap_returns_storage_keys_of_expired_attachments_only() {
+        let conn = mem_db();
+        let acc = register_account(&conn, "dave", "k").unwrap();
+        let fresh = create_attachment(&conn, &acc.device_id, 10).unwrap();
+        let stale = create_attachment(&conn, &acc.device_id, 10).unwrap();
+
+        // Simulate the stale slot's TTL having already elapsed — the
+        // public create_attachment API always sets a future expiry, so
+        // backdating it directly is the only way to exercise reaping.
+        conn.execute(
+            "UPDATE attachments SET expires_at = ?1 WHERE attachment_id = ?2",
+            params![now() - 1, stale.attachment_id],
+        )
+        .unwrap();
+
+        let reaped_keys = reap_expired_with_attachment_keys(&conn).unwrap();
+        assert_eq!(reaped_keys, vec![stale.storage_key]);
+
+        // The fresh attachment must survive the sweep, the stale one must not.
+        assert!(get_attachment(&conn, &fresh.attachment_id).unwrap().is_some());
+        assert!(get_attachment(&conn, &stale.attachment_id).unwrap().is_none());
     }
 }

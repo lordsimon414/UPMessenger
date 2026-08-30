@@ -17,3 +17,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 tiny_http = "0.12"
 rand = "0.8"
 sha2 = "0.10"
+
+# Windows Service wrapper (SRS §10 target platform). Not fetched/compiled
+# on other platforms, so `cargo build`/`cargo test` on Linux CI is
+# unaffected by this — see src/service.rs, which is entirely
+# #[cfg(windows)].
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"

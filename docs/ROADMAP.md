@@ -3,7 +3,7 @@
 | Phase | Deliverable | Priority | Status |
 |---|---|---|---|
 | 0. Foundation | Repo structure, protocol versioning, Rust core boundaries, CI, threat model | P0 | **Implemented** |
-| 1. Server skeleton | Windows service, SQLite schema, TLS, account directory, queue | P0 | **Partially done**: SQLite schema, REST API, challenge-response auth, device-scoped pull/ack, bounded TTL queue, and localhost binding are implemented. Windows-service packaging and deployment hardening remain open. |
+| 1. Server skeleton | Windows service, SQLite schema, TLS, account directory, queue | P0 | **Done for this repo's scope**: SQLite schema, REST API, challenge-response auth, device-scoped pull/ack, bounded TTL queue, localhost binding, and a Windows service wrapper (install/uninstall/SCM integration) are implemented. Deployment hardening (firewall/ACL docs) remains open. |
 | 2. Crypto/session core | Identity keys, session establishment, ratchet integration, envelope format | P0 | **Partially done**: primitive wrappers, UPM X3DH-style OPKs, transactional Double-Ratchet-style session, versioned server queue envelopes, and restart-persistent client session/history state are implemented. A standards-compatible Signal/X3DH implementation is not claimed and still requires independent review. |
 | 3. Windows + Android | 1:1 messaging, encrypted local DB, attachments | P0 | **In progress**: Windows 1:1 E2EE, UPM X3DH-style OPKs, transactional Double-Ratchet state, encrypted local history/outbox recovery, and client-side encrypted attachment upload/download are wired. Android client and stronger key-change UX remain. |
 | 4. iOS | Shared core integration, Keychain, APNs-compatible wakeup flow | P0 | Not started |
@@ -65,16 +65,22 @@
   open by design. Verified end-to-end against a real Ed25519 keypair
   (Python `cryptography`), including a cross-device 403 check.
   Binds to localhost only by design — TLS and public exposure are left to
-  a reverse proxy / Cloudflare Tunnel per SRS §10.1. No Windows-service
-  wrapper yet (currently a plain console binary); no WebSocket/streaming
-  push (clients must poll `GET /v1/messages/pull` for now).
+  a reverse proxy / Cloudflare Tunnel per SRS §10.1. Runs as a proper
+  Windows service (`upm-server install` / `upm-server uninstall`, SCM
+  status reporting, clean shutdown on Stop/Shutdown control) as well as
+  interactively in a console — same underlying server code either way,
+  see `main.rs`/`service.rs`. Concurrent request handling (worker-thread
+  pool, default 8, panic-isolated per request) and a periodic maintenance
+  sweep (expired rows, orphaned attachment blobs, WAL checkpoint) are also
+  in place. No WebSocket/streaming push (clients must poll
+  `GET /v1/messages/pull` for now).
 - CI: `cargo build`, `cargo test`, `cargo clippy -- -D warnings`,
   `cargo fmt --check` on every push (see `.github/workflows/ci.yml`).
 
 ## Next concrete steps
 
 1. Add stronger device/key-change UX and explicit trust-state screens in the Windows client.
-2. Package `upm-server` as a Windows service and document filesystem ACL/firewall/Cloudflare Tunnel deployment.
+2. Verify the Windows service wrapper on an actual Windows machine (build, `install`, `sc start`, confirm clean `sc stop`) — it could only be written and reasoned through here, not compiled or run, since this development environment is Linux-only. Document filesystem ACL/firewall/Cloudflare Tunnel deployment alongside it.
 3. Add request/queue/disk quotas, fuzz/property tests, privacy-log tests, and restart/interoperability tests. A local `upm-smoke` transport test now covers registration/authentication/send/pull/ack.
 4. Finish Windows security UX and platform abstraction work, then start Android client integration against the same protocol/core boundaries, followed by iOS and Web as specified in SRS §23.
 5. Keep the UPM X3DH-style design explicitly versioned; do not call it Signal/X3DH-compatible without independent review.

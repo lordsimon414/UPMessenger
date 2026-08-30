@@ -65,6 +65,7 @@ enum ChatPayload {
 struct ChatLine {
     direction: Direction,
     text: String,
+    at: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -184,9 +185,38 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Formats a Unix timestamp as `HH:MM` UTC. Deliberately dependency-free
+/// (no `chrono`/`time` crate, matching the rest of this codebase's
+/// minimal-dependency style) — this is UTC, not the viewer's local time
+/// zone; swap in a proper time crate if local-time display matters later.
+fn format_time_hhmm(unix_secs: i64) -> String {
+    let secs_of_day = unix_secs.rem_euclid(86_400);
+    format!("{:02}:{:02}", secs_of_day / 3600, (secs_of_day / 60) % 60)
+}
+
 fn fingerprint_hex(identity_public_key: &[u8; 32]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(identity_public_key);
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    hex.as_bytes().chunks(8).map(|c| String::from_utf8_lossy(c).to_string()).collect::<Vec<_>>().join(" ")
+}
+
+/// A "safety number"-style combined fingerprint over two identity keys.
+/// Symmetric by construction (the smaller key always goes first), so both
+/// conversation partners compute the exact same string regardless of who
+/// is "self" and who is "peer" — meant to be read aloud or compared over
+/// an independent channel (in person, a phone call, a separate app) to
+/// catch a first-contact impersonation that TOFU pinning alone cannot
+/// detect (SECURITY_REVIEW.md finding #1: TOFU only protects against a
+/// key *changing after* first contact, not a malicious/compromised
+/// directory server lying about a key on the very first lookup).
+fn safety_number(a: &[u8; 32], b: &[u8; 32]) -> String {
+    use sha2::{Digest, Sha256};
+    let (first, second) = if a <= b { (a, b) } else { (b, a) };
+    let mut hasher = Sha256::new();
+    hasher.update(first);
+    hasher.update(second);
+    let digest = hasher.finalize();
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     hex.as_bytes().chunks(8).map(|c| String::from_utf8_lossy(c).to_string()).collect::<Vec<_>>().join(" ")
 }
@@ -214,7 +244,7 @@ impl UpmApp {
         let api = ApiClient::new(&profile.server_url).ok();
         let identity = load_or_generate_identity();
         let local_store = LocalStore::open().ok();
-        Self {
+        let mut app = Self {
             profile,
             identity,
             api,
@@ -226,7 +256,18 @@ impl UpmApp {
             local_store,
             last_poll: 0.0,
             directory_visible: true,
+        };
+        // Auto-login: a returning user already has a device_id from a
+        // previous run, so log them straight back in instead of leaving
+        // them stuck behind a manual "Log in" click every launch. A
+        // network hiccup or an expired/unregistered device here is not
+        // fatal — authenticate() reports it in self.status and the user
+        // can still hit "Log in" manually.
+        if app.profile.device_id.is_some() {
+            app.status = "Logging in…".into();
+            app.authenticate();
         }
+        app
     }
 
     fn save(&mut self) {
@@ -315,16 +356,26 @@ impl UpmApp {
 
     fn logout(&mut self) {
         let token = self.profile.session_token.clone();
-        let Some(api) = self.api.clone() else { return; };
-        if let Some(token) = token {
-            match api.logout(&token) {
+        // Best-effort server-side logout only when we actually have a
+        // connection; the local logout below must happen regardless, or
+        // "Log out" would silently do nothing while offline.
+        if let (Some(token), Some(api)) = (&token, self.api.clone()) {
+            match api.logout(token) {
                 Ok(()) => self.status = "Logged out".into(),
-                Err(e) => self.status = format!("Logout failed: {e}"),
+                Err(e) => self.status = format!("Logged out locally (server logout failed: {e})"),
             }
+        } else {
+            self.status = "Logged out".into();
         }
         self.profile.session_token = None;
         self.profile.session_expires_at = None;
         let _ = storage::save(&self.profile);
+        // Clean slate: an old conversation/session/lookup belonging to the
+        // just-ended login shouldn't linger and look usable in the UI.
+        self.conversation = None;
+        self.directory = None;
+        self.new_contact.clear();
+        self.message_input.clear();
     }
 
     fn resolve(&mut self) {
@@ -357,8 +408,8 @@ impl UpmApp {
         let mut conversation = Conversation { peer, session: None, lines: Vec::new() };
         if let Some(store) = &self.local_store {
             conversation.session = store.load_session(&conversation.peer.device_id).map_err(|e| e.to_string())?;
-            conversation.lines = store.load_messages(&conversation.peer.device_id).map_err(|e| e.to_string())?.into_iter().map(|(incoming, text)| ChatLine {
-                direction: if incoming { Direction::Incoming } else { Direction::Outgoing }, text,
+            conversation.lines = store.load_messages(&conversation.peer.device_id).map_err(|e| e.to_string())?.into_iter().map(|(incoming, text, at)| ChatLine {
+                direction: if incoming { Direction::Incoming } else { Direction::Outgoing }, text, at,
             }).collect();
         }
         self.conversation = Some(conversation);
@@ -396,6 +447,20 @@ impl UpmApp {
             one_time_prekey_signature: opk_signature,
         };
         let hs = handshake::initiate(&self.identity.exchange, &bundle).map_err(|e| e.to_string())?;
+        if hs.one_time_prekey_id.is_none() {
+            // SECURITY_REVIEW.md finding #2: the server can legitimately
+            // report "no one-time prekey available", but a compromised
+            // server could also lie about that to force every handshake
+            // onto the weaker 3-DH path — nothing can cryptographically
+            // tell the two cases apart. The best available mitigation is
+            // making the degradation *visible* instead of silent, so the
+            // user (or a future automated check) can at least notice a
+            // pattern of "this contact never seems to have a prekey".
+            self.status = format!(
+                "Starting a session with @{} without a one-time prekey (server reported none available) — this weakens protection of this specific handshake only if a signed prekey is later compromised; the ongoing conversation's forward secrecy is unaffected.",
+                peer.username
+            );
+        }
         let mut session = DoubleRatchetSession::init_initiator(peer_device, &hs.result, hs.bob_initial_ratchet_public).map_err(|e| e.to_string())?;
         let mut bootstrap = SessionBootstrap {
             sender_identity_signing_public: self.identity.signing.public_key(),
@@ -434,7 +499,7 @@ impl UpmApp {
         match api.send_envelope(&token, &envelope) {
             Ok(()) => {
                 if let Some(store) = &self.local_store { let _ = store.commit_outgoing_delivery(&outbox, &candidate_session, unix_now()); }
-                if let Some(conversation) = &mut self.conversation { conversation.session = Some(candidate_session); conversation.lines.push(ChatLine { direction: Direction::Outgoing, text: display_text }); }
+                if let Some(conversation) = &mut self.conversation { conversation.session = Some(candidate_session); conversation.lines.push(ChatLine { direction: Direction::Outgoing, text: display_text, at: unix_now() }); }
                 self.status = "Encrypted message queued".into();
             }
             Err(e) => self.status = format!("Send failed (outbox retained): {e}"),
@@ -488,6 +553,12 @@ impl UpmApp {
         let sender_exchange = bootstrap.sender_identity_exchange_public;
         let hs = handshake::respond(&self.identity.exchange, &self.identity.signed_prekey, &sender_exchange, &bootstrap.ephemeral_public, opk)?;
         let session = DoubleRatchetSession::init_responder(sender_device, &hs, self.identity.signed_prekey.clone());
+        if bootstrap.one_time_prekey_id.is_none() {
+            // Symmetric to the initiator-side note in make_initial_outgoing_packet:
+            // this incoming handshake didn't claim a one-time prekey. Make that
+            // visible rather than silent — see SECURITY_REVIEW.md finding #2.
+            self.status = "Incoming session started without a one-time prekey — this weakens protection of this specific handshake only if a signed prekey is later compromised; the ongoing conversation's forward secrecy is unaffected.".into();
+        }
         Ok((session, bootstrap.one_time_prekey_id))
     }
 
@@ -571,7 +642,7 @@ impl UpmApp {
                     persist_identity_secrets(&self.identity);
                 }
             }
-            conversation.lines.push(ChatLine { direction: Direction::Incoming, text: display });
+            conversation.lines.push(ChatLine { direction: Direction::Incoming, text: display, at: unix_now() });
             ack_ids.push(item.message_id);
             count += 1;
         }
@@ -598,47 +669,227 @@ impl eframe::App for UpmApp {
             self.poll();
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
-        egui::TopBottomPanel::top("top").show(ctx, |ui| { ui.horizontal(|ui| { ui.heading("UPM"); ui.separator(); ui.label(&self.status); }); });
-        egui::SidePanel::left("sidebar").resizable(true).show(ctx, |ui| {
-            ui.heading("Connection");
-            ui.text_edit_singleline(&mut self.profile.server_url);
-            if ui.button("Connect").clicked() { self.reconnect(); }
-            ui.separator();
-            ui.heading("Identity");
-            ui.text_edit_singleline(&mut self.profile.username);
-            if let Some(id) = &self.profile.upm_id { ui.label(format!("UPM ID: {id}")); }
-            if let Some(d) = &self.profile.device_id { ui.small(format!("Device: {d}")); }
-            ui.horizontal(|ui| { if ui.button("Register").clicked() { self.register(); } if ui.button("Authenticate").clicked() { self.authenticate(); } if ui.button("Log out").clicked() { self.logout(); } });
-            if self.profile.session_token.is_some() {
-                ui.small(format!("Protocol: v{}", ProtocolVersion::CURRENT.0));
-                if let Some(expires) = self.profile.session_expires_at { ui.small(format!("Session expires: {expires}")); }
-            }
-            let identity_pub = self.identity.signing.public_key();
-            ui.small(format!("Identity fingerprint: {}", fingerprint_hex(&identity_pub)));
-            if self.profile.session_token.is_some() {
-                let response = ui.checkbox(&mut self.directory_visible, "Discoverable in directory");
-                if response.changed() { self.update_directory_visibility(); }
-            }
-            ui.separator();
-            ui.heading("Contact");
-            ui.horizontal(|ui| { ui.text_edit_singleline(&mut self.new_contact); if ui.button("Resolve").clicked() { self.resolve(); } });
-            if let Some(entry) = &self.directory { ui.label(format!("@{} — {}", entry.username, entry.upm_id)); ui.small(format!("Device: {}", entry.device_id)); }
-            if ui.button("Pull now").clicked() { self.poll(); }
+
+        let connected = self.api.is_some();
+        let authenticated = self.profile.session_token.is_some();
+        let (status_color, status_word) = if authenticated {
+            (egui::Color32::from_rgb(0x2e, 0xa0, 0x4f), "Authenticated")
+        } else if connected {
+            (egui::Color32::from_rgb(0xd0, 0x9a, 0x1e), "Connected")
+        } else {
+            (egui::Color32::from_rgb(0xb0, 0x3a, 0x3a), "Offline")
+        };
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading(egui::RichText::new("UPM").strong());
+                ui.separator();
+                ui.colored_label(status_color, "●");
+                ui.label(status_word);
+                ui.separator();
+                ui.label(egui::RichText::new(&self.status).weak());
+            });
+            ui.add_space(4.0);
         });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Conversation");
-            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                if let Some(conversation) = &self.conversation {
-                    for line in &conversation.lines { let label = match line.direction { Direction::Incoming => "Peer", Direction::Outgoing => "You" }; ui.label(format!("{label}: {}", line.text)); ui.separator(); }
+
+        egui::SidePanel::left("sidebar").resizable(true).default_width(280.0).show(ctx, |ui| {
+            ui.add_space(6.0);
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new("Server").strong());
+                ui.add_space(4.0);
+                ui.text_edit_singleline(&mut self.profile.server_url);
+                ui.add_space(4.0);
+                if ui.button("Connect").clicked() { self.reconnect(); }
+            });
+
+            ui.add_space(8.0);
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new("Identity").strong());
+                ui.add_space(4.0);
+                ui.add_enabled_ui(!authenticated, |ui| {
+                    ui.text_edit_singleline(&mut self.profile.username);
+                });
+                ui.add_space(4.0);
+                let has_account = self.profile.device_id.is_some();
+                ui.horizontal_wrapped(|ui| {
+                    if authenticated {
+                        if ui.button("Log out").clicked() { self.logout(); }
+                    } else if has_account {
+                        if ui.button("Log in").clicked() { self.authenticate(); }
+                        if ui.small_button("Register new account").clicked() { self.register(); }
+                    } else {
+                        if ui.button("Register").clicked() { self.register(); }
+                    }
+                });
+                ui.add_space(6.0);
+                if let Some(id) = &self.profile.upm_id { ui.label(format!("UPM ID: {id}")); }
+                if let Some(d) = &self.profile.device_id { ui.small(egui::RichText::new(format!("Device: {d}")).monospace().weak()); }
+                if authenticated {
+                    ui.small(format!("Protocol: v{}", ProtocolVersion::CURRENT.0));
+                    if let Some(expires) = self.profile.session_expires_at { ui.small(format!("Session expires: {expires}")); }
+                }
+                ui.add_space(6.0);
+                let identity_pub = self.identity.signing.public_key();
+                egui::Frame::none()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .rounding(4.0)
+                    .inner_margin(6.0)
+                    .show(ui, |ui| {
+                        ui.small(egui::RichText::new(fingerprint_hex(&identity_pub)).monospace());
+                    });
+                if authenticated {
+                    ui.add_space(4.0);
+                    let response = ui.checkbox(&mut self.directory_visible, "Discoverable in directory");
+                    if response.changed() { self.update_directory_visibility(); }
                 }
             });
+
+            ui.add_space(8.0);
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new("Contact").strong());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.new_contact);
+                    if ui.button("Resolve").clicked() { self.resolve(); }
+                });
+                if let Some(entry) = &self.directory {
+                    ui.add_space(6.0);
+                    egui::Frame::none()
+                        .fill(ui.visuals().faint_bg_color)
+                        .rounding(4.0)
+                        .inner_margin(6.0)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(format!("@{}", entry.username)).strong());
+                            ui.small(&entry.upm_id);
+                            ui.small(egui::RichText::new(format!("Device: {}", entry.device_id)).weak());
+                        });
+                    // Safety number: read this aloud with your contact over
+                    // an independent channel (in person, a phone call) to
+                    // confirm you're both pinned to the same identity key.
+                    // TOFU alone only catches a key *changing later* — it
+                    // can't catch a compromised directory server lying on
+                    // the very first lookup (SECURITY_REVIEW.md finding #1).
+                    if let Ok(their_key) = decode_32(&entry.identity_public_key) {
+                        let my_key = self.identity.signing.public_key();
+                        ui.add_space(6.0);
+                        ui.small(egui::RichText::new("Safety number (compare with your contact):").weak());
+                        egui::Frame::none()
+                            .fill(ui.visuals().extreme_bg_color)
+                            .rounding(4.0)
+                            .inner_margin(6.0)
+                            .show(ui, |ui| {
+                                ui.small(egui::RichText::new(safety_number(&my_key, &their_key)).monospace());
+                            });
+                    }
+                }
+            });
+
+            ui.add_space(8.0);
+            if ui.button("⟳  Pull now").clicked() { self.poll(); }
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if !authenticated {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() / 2.0 - 40.0);
+                    ui.heading(egui::RichText::new("You're logged out").weak());
+                    ui.label("Log in on the left to see your conversations and send messages.");
+                });
+                return;
+            }
+            let peer_heading = self.conversation.as_ref().map(|c| {
+                if c.peer.username.is_empty() { c.peer.device_id.clone() } else { format!("@{}", c.peer.username) }
+            });
+            ui.add_space(4.0);
+            match &peer_heading {
+                Some(name) => { ui.heading(name); }
+                None => { ui.heading(egui::RichText::new("No conversation yet").weak()); }
+            }
+            ui.separator();
+
+            let available_height = ui.available_height() - 56.0;
+            egui::ScrollArea::vertical().stick_to_bottom(true).max_height(available_height.max(80.0)).show(ui, |ui| {
+                ui.add_space(4.0);
+                if let Some(conversation) = &self.conversation {
+                    if conversation.lines.is_empty() {
+                        ui.label(egui::RichText::new("No messages yet — say hello.").weak());
+                    }
+                    for line in &conversation.lines {
+                        let outgoing = matches!(line.direction, Direction::Outgoing);
+                        let bubble_fill = if outgoing { ui.visuals().selection.bg_fill } else { ui.visuals().faint_bg_color };
+                        let text_color = if outgoing { egui::Color32::WHITE } else { ui.visuals().text_color() };
+                        let layout = if outgoing { egui::Layout::right_to_left(egui::Align::Min) } else { egui::Layout::left_to_right(egui::Align::Min) };
+                        ui.with_layout(layout, |ui| {
+                            ui.set_max_width(ui.available_width() * 0.75);
+                            egui::Frame::none()
+                                .fill(bubble_fill)
+                                .rounding(8.0)
+                                .inner_margin(9.0)
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(egui::RichText::new(&line.text).color(text_color));
+                                        ui.small(egui::RichText::new(format_time_hhmm(line.at)).color(text_color.gamma_multiply(0.75)));
+                                    });
+                                });
+                        });
+                        ui.add_space(4.0);
+                    }
+                } else {
+                    ui.label(egui::RichText::new("Resolve a contact on the left to start a conversation.").weak());
+                }
+            });
+
             ui.separator();
             ui.horizontal(|ui| {
-                let send = ui.text_edit_singleline(&mut self.message_input).lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button("Send encrypted").clicked() || send { self.send_message(); }
-                if ui.button("Attach file").clicked() { self.send_attachment(); }
+                let text_edit = ui.add_sized([ui.available_width() - 170.0, 0.0], egui::TextEdit::singleline(&mut self.message_input).hint_text("Type a message…"));
+                let send = text_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Send").clicked() || send { self.send_message(); }
+                if ui.button("📎 Attach").clicked() { self.send_attachment(); }
             });
-            ui.small("Phase 3: Windows 1:1 E2EE, X3DH-style OPKs, restart-persistent local state, encrypted attachments, automatic polling. This remains an engineering build, not a security certification.");
+            ui.add_space(2.0);
+            ui.small(egui::RichText::new("Phase 3: Windows 1:1 E2EE, X3DH-style OPKs, restart-persistent local state, encrypted attachments, automatic polling. This remains an engineering build, not a security certification.").weak());
         });
+    }
+}
+
+#[cfg(test)]
+mod safety_number_tests {
+    use super::{fingerprint_hex, safety_number};
+
+    #[test]
+    fn safety_number_is_symmetric_regardless_of_argument_order() {
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
+        assert_eq!(safety_number(&a, &b), safety_number(&b, &a), "both conversation partners must compute the same safety number");
+    }
+
+    #[test]
+    fn safety_number_differs_for_different_key_pairs() {
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
+        let c = [0x33u8; 32];
+        assert_ne!(safety_number(&a, &b), safety_number(&a, &c));
+    }
+
+    #[test]
+    fn safety_number_is_deterministic() {
+        let a = [0xAAu8; 32];
+        let b = [0xBBu8; 32];
+        assert_eq!(safety_number(&a, &b), safety_number(&a, &b));
+    }
+
+    #[test]
+    fn fingerprint_hex_is_deterministic_and_key_dependent() {
+        let a = [0x01u8; 32];
+        let b = [0x02u8; 32];
+        assert_eq!(fingerprint_hex(&a), fingerprint_hex(&a));
+        assert_ne!(fingerprint_hex(&a), fingerprint_hex(&b));
     }
 }

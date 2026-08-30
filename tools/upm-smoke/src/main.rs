@@ -32,12 +32,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base = env::args().nth(1).unwrap_or_else(|| "http://127.0.0.1:8787".into());
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
+    client.get(url(&base, "/v1/health")).send()?.error_for_status()?;
+
+    let suffix = rand::random::<u32>();
+    let alice_username = format!("smoke-alice-{suffix}");
+    let bob_username = format!("smoke-bob-{suffix}");
     let alice_kp = IdentityKeyPair::generate();
     let bob_kp = IdentityKeyPair::generate();
-    let alice = register(&client, &base, "smoke-alice", &alice_kp)?;
-    let bob = register(&client, &base, "smoke-bob", &bob_kp)?;
+    let alice = register(&client, &base, &alice_username, &alice_kp)?;
+    let bob = register(&client, &base, &bob_username, &bob_kp)?;
+
+    // Account creation must reject a duplicate username instead of
+    // silently creating a second identity under the same name.
+    let duplicate_kp = IdentityKeyPair::generate();
+    let duplicate_response = client
+        .post(url(&base, "/v1/account/register"))
+        .json(&Register { username: &alice_username, identity_public_key: base64::engine::general_purpose::STANDARD.encode(duplicate_kp.public_key()) })
+        .send()?;
+    if duplicate_response.status().as_u16() != 409 {
+        return Err(format!("duplicate username was not rejected: {}", duplicate_response.status()).into());
+    }
+
     let alice_token = login(&client, &base, &alice.device_id, &alice_kp)?;
     let bob_token = login(&client, &base, &bob.device_id, &bob_kp)?;
+
+    // A second login must also work: challenge nonces are one-shot, but
+    // clients should be able to authenticate again after a restart/logout.
+    let alice_token2 = login(&client, &base, &alice.device_id, &alice_kp)?;
+    let logout_response = client
+        .delete(url(&base, "/v1/auth/session"))
+        .bearer_auth(&alice_token2)
+        .send()?;
+    logout_response.error_for_status()?;
+    let alice_token = login(&client, &base, &alice.device_id, &alice_kp)?;
 
     let message_id = format!("{:032X}", rand::random::<u128>());
     let plaintext_marker = format!("UPM-SMOKE-{}", rand::random::<u64>());
@@ -61,6 +88,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let response = client.post(url(&base, "/v1/messages/ack")).bearer_auth(&bob_token).json(&ack_body).send()?;
     if !response.status().is_success() { return Err(format!("ack failed: {}", response.status()).into()); }
 
+    println!("Health endpoint: OK");
+    println!("Account creation: OK");
+    println!("Duplicate username rejection: OK");
+    println!("Challenge-response login: OK");
+    println!("Logout + relogin: OK");
     println!("UPM smoke test PASSED");
     println!("Alice: @{} / {}", alice.upm_id, alice.device_id);
     println!("Bob:   @{} / {}", bob.upm_id, bob.device_id);

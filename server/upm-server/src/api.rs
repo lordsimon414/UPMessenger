@@ -64,9 +64,42 @@ fn client_key(request: &Request) -> String {
 /// logging more than needed to see the server is behaving. Correlate with
 /// `CF-Connecting-IP`/tunnel-level logs if per-client debugging is ever
 /// needed for abuse investigation.
+///
+/// The path itself is also normalized before logging (see
+/// `normalize_path_for_logging`): several routes embed an identifier
+/// directly in the URL *path* rather than a query string (e.g.
+/// `/v1/directory/resolve/{username}`), which the query-string exclusion
+/// above does nothing to catch — normalizing route parameters to `:param`
+/// closes that gap so those identifiers can't accumulate in the log
+/// either.
 fn log_line(method: &Method, path: &str, status: u16) {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    println!("{now} {method:?} {path} {status}");
+    let normalized = normalize_path_for_logging(path);
+    println!("{now} {method:?} {normalized} {status}");
+}
+
+/// Replaces every path segment that's a route *parameter* (a username, UPM
+/// ID, device ID, or attachment ID) with `:param`, leaving the fixed route
+/// structure intact. Mirrors the route table in `route()` below — a
+/// logging-only concern kept deliberately simple (segment position/count,
+/// not a full router) rather than trying to share code with `route()`,
+/// since the two have different failure modes if they drift (a routing
+/// bug rejects a request loudly; a logging-normalization bug just logs one
+/// extra identifier, which is why this list is reviewed here explicitly
+/// rather than assumed to stay in sync automatically).
+fn normalize_path_for_logging(path: &str) -> String {
+    let segments: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    let normalized: Vec<&str> = match segments.as_slice() {
+        ["v1", "directory", "resolve", _] => vec!["v1", "directory", "resolve", ":param"],
+        ["v1", "directory", "resolve-id", _] => vec!["v1", "directory", "resolve-id", ":param"],
+        ["v1", "profile", "public", _] => vec!["v1", "profile", "public", ":param"],
+        ["v1", "devices", "keys", _] => vec!["v1", "devices", "keys", ":param"],
+        ["v1", "attachments", "create"] => vec!["v1", "attachments", "create"],
+        ["v1", "attachments", _] => vec!["v1", "attachments", ":param"],
+        ["v1", "attachments", _, "blob"] => vec!["v1", "attachments", ":param", "blob"],
+        _ => return format!("/{}", segments.join("/")),
+    };
+    format!("/{}", normalized.join("/"))
 }
 
 pub fn handle(state: &AppState, mut request: Request) {
@@ -197,6 +230,7 @@ fn route(
 
     match (method, seg.as_slice()) {
         // Open endpoints.
+        (Method::Get, ["v1", "health"]) => ok(200, json!({ "ok": true })),
         (Method::Post, ["v1", "account", "register"]) => {
             if !state.register_limiter.check(client_key) {
                 return error(429, "rate_limited", "too many registration attempts, try again later");
@@ -308,6 +342,12 @@ fn valid_public_key(candidate: &str) -> bool {
     decode_fixed::<32>(candidate).is_some()
 }
 
+fn valid_username(username: &str) -> bool {
+    let char_len = username.chars().count();
+    (3..=32).contains(&char_len)
+        && !username.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 fn current_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -331,8 +371,9 @@ fn handle_register(state: &AppState, body: &str) -> (u16, String) {
         Err(_) => return error(400, "bad_request", "invalid registration payload"),
     };
 
-    if req.username.len() < 3 || req.username.len() > 32 {
-        return error(400, "invalid_username", "username must be 3-32 characters");
+    let username = req.username.trim();
+    if !valid_username(username) {
+        return error(400, "invalid_username", "username must be 3-32 characters and must not contain spaces or control characters");
     }
     if !valid_public_key(&req.identity_public_key) {
         return error(
@@ -343,7 +384,7 @@ fn handle_register(state: &AppState, body: &str) -> (u16, String) {
     }
 
     let conn = state.db.lock().expect("db mutex poisoned");
-    match db::register_account(&conn, &req.username, &req.identity_public_key) {
+    match db::register_account(&conn, username, &req.identity_public_key) {
         Ok(acc) => ok(
             201,
             json!({ "user_id": acc.user_id, "upm_id": acc.upm_id, "device_id": acc.device_id }),
@@ -992,11 +1033,68 @@ mod tests {
     }
 
     #[test]
+    fn logging_normalizes_identifiers_embedded_in_the_path() {
+        // These all embed a sensitive identifier directly in the URL path
+        // (not a query string) — the access log must not leak it.
+        assert_eq!(normalize_path_for_logging("/v1/directory/resolve/alice"), "/v1/directory/resolve/:param");
+        assert_eq!(normalize_path_for_logging("/v1/directory/resolve-id/KML3-9V8E-PE4G"), "/v1/directory/resolve-id/:param");
+        assert_eq!(normalize_path_for_logging("/v1/profile/public/alice"), "/v1/profile/public/:param");
+        assert_eq!(normalize_path_for_logging("/v1/devices/keys/AABBCCDD"), "/v1/devices/keys/:param");
+        assert_eq!(normalize_path_for_logging("/v1/attachments/AABBCCDD"), "/v1/attachments/:param");
+        assert_eq!(normalize_path_for_logging("/v1/attachments/AABBCCDD/blob"), "/v1/attachments/:param/blob");
+    }
+
+    #[test]
+    fn logging_leaves_static_routes_untouched() {
+        // None of these have a parameter to redact — a real bug in the
+        // normalizer would either leave an identifier route un-redacted
+        // above, or (this test's job) over-redact a route that has none.
+        assert_eq!(normalize_path_for_logging("/v1/account/register"), "/v1/account/register");
+        assert_eq!(normalize_path_for_logging("/v1/auth/challenge"), "/v1/auth/challenge");
+        assert_eq!(normalize_path_for_logging("/v1/auth/verify"), "/v1/auth/verify");
+        assert_eq!(normalize_path_for_logging("/v1/auth/session"), "/v1/auth/session");
+        assert_eq!(normalize_path_for_logging("/v1/profile/privacy"), "/v1/profile/privacy");
+        assert_eq!(normalize_path_for_logging("/v1/devices/keys"), "/v1/devices/keys");
+        assert_eq!(normalize_path_for_logging("/v1/devices/prekeys"), "/v1/devices/prekeys");
+        assert_eq!(normalize_path_for_logging("/v1/devices/prekeys/claim"), "/v1/devices/prekeys/claim");
+        assert_eq!(normalize_path_for_logging("/v1/messages/send"), "/v1/messages/send");
+        assert_eq!(normalize_path_for_logging("/v1/messages/pull"), "/v1/messages/pull");
+        assert_eq!(normalize_path_for_logging("/v1/messages/ack"), "/v1/messages/ack");
+        assert_eq!(normalize_path_for_logging("/v1/attachments/create"), "/v1/attachments/create");
+    }
+
+    #[test]
+    fn logging_passes_through_unknown_routes_unchanged() {
+        assert_eq!(normalize_path_for_logging("/v1/nope"), "/v1/nope");
+        assert_eq!(normalize_path_for_logging("/"), "/");
+    }
+
+    #[test]
     fn valid_public_key_checks_length() {
         let good = base64_encode(&[1u8; 32]);
         let bad = base64_encode(&[1u8; 20]);
         assert!(valid_public_key(&good));
         assert!(!valid_public_key(&bad));
         assert!(!valid_public_key("not base64 at all!!"));
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::valid_username;
+
+    #[test]
+    fn username_validation_accepts_normal_names_and_unicode() {
+        assert!(valid_username("alice"));
+        assert!(valid_username("Max-1"));
+        assert!(valid_username("Мария"));
+    }
+
+    #[test]
+    fn username_validation_rejects_spaces_and_bad_lengths() {
+        assert!(!valid_username("al"));
+        assert!(!valid_username("alice smith"));
+        assert!(!valid_username("alice\nsmith"));
+        assert!(!valid_username("a".repeat(33).as_str()));
     }
 }

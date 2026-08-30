@@ -13,3 +13,11 @@
 ## Previous — Phase 0–3
 
 See `docs/ROADMAP.md` and `docs/SECURITY_REVIEW.md` for the detailed implementation and security history.
+
+## Login/account flow hardening
+
+- Windows client now uses the current server URL for Register/Login actions rather than a stale cached client handle.
+- Added server health check and connection timeout handling.
+- Registration trims/validates usernames consistently and reports duplicate names cleanly.
+- Login reports stale-device/server mismatch explicitly and supports a local new-account reset.
+- Added repeatable auth/account checks to `upm-smoke`.

@@ -1,5 +1,6 @@
 use base64::Engine;
 use reqwest::blocking::Client;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -101,12 +102,32 @@ impl ApiClient {
     pub fn new(base: impl Into<String>) -> Result<Self, ApiError> {
         let mut base = base.into().trim().trim_end_matches('/').to_string();
         if base.is_empty() {
-            base = "https://127.0.0.1".into();
+            base = "http://127.0.0.1:8787".into();
         }
-        Ok(Self {
-            base,
-            http: Client::builder().build()?,
-        })
+        let parsed = Url::parse(&base).map_err(|e| ApiError::Server {
+            status: 0,
+            message: format!("invalid server URL: {e}"),
+        })?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            other => {
+                return Err(ApiError::Server {
+                    status: 0,
+                    message: format!("unsupported server URL scheme: {other}"),
+                });
+            }
+        }
+        if parsed.host_str().is_none() {
+            return Err(ApiError::Server {
+                status: 0,
+                message: "server URL has no host".into(),
+            });
+        }
+        let http = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(20))
+            .build()?;
+        Ok(Self { base, http })
     }
 
     fn url(&self, path: &str) -> String {
@@ -117,15 +138,27 @@ impl ApiClient {
         let status = response.status();
         let body = response.text()?;
         if !status.is_success() {
-            return Err(ApiError::Server { status: status.as_u16(), message: body });
+            let message = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).map(str::to_owned))
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| body.lines().next().unwrap_or("request failed").trim().to_string());
+            return Err(ApiError::Server { status: status.as_u16(), message });
         }
         Ok(serde_json::from_str(&body)?)
     }
 
     pub fn register(&self, username: &str, identity_public_key: &str) -> Result<RegisterResponse, ApiError> {
+        let username = username.trim();
         let response = self.http.post(self.url("/v1/account/register"))
             .json(&RegisterRequest { username, identity_public_key }).send()?;
         self.check(response)
+    }
+
+    pub fn health(&self) -> Result<(), ApiError> {
+        let response = self.http.get(self.url("/v1/health")).send()?;
+        let _: serde_json::Value = self.check(response)?;
+        Ok(())
     }
 
     pub fn challenge(&self, device_id: &str) -> Result<(Vec<u8>, i64), ApiError> {

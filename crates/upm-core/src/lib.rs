@@ -34,7 +34,7 @@ pub enum SessionError {
     Replay,
     #[error("session not yet established with this device")]
     NotEstablished,
-    #[error("peer's message counter skipped too many messages ahead (possible attack or corrupted state)")]
+    #[error("peer's message counter is far ahead of the last one decrypted (usually a long gap since the two of you last synced; corrupted local state is possible but less likely)")]
     TooManySkipped,
 }
 

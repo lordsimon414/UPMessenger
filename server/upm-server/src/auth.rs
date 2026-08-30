@@ -195,7 +195,7 @@ pub fn verify_and_issue_session(
 
     let identity_public_key_b64: Option<String> = conn
         .query_row(
-            "SELECT identity_public_key FROM devices WHERE device_id = ?1",
+            "SELECT d.identity_public_key FROM devices d JOIN users u ON u.user_id = d.user_id WHERE d.device_id = ?1 AND u.status = 'active' AND d.device_id IS NOT NULL",
             params![device_id],
             |r| r.get(0),
         )

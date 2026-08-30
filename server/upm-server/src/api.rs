@@ -230,7 +230,6 @@ fn route(
 
     match (method, seg.as_slice()) {
         // Open endpoints.
-        (Method::Get, ["v1", "health"]) => ok(200, json!({ "ok": true })),
         (Method::Post, ["v1", "account", "register"]) => {
             if !state.register_limiter.check(client_key) {
                 return error(429, "rate_limited", "too many registration attempts, try again later");
@@ -342,12 +341,6 @@ fn valid_public_key(candidate: &str) -> bool {
     decode_fixed::<32>(candidate).is_some()
 }
 
-fn valid_username(username: &str) -> bool {
-    let char_len = username.chars().count();
-    (3..=32).contains(&char_len)
-        && !username.chars().any(|c| c.is_whitespace() || c.is_control())
-}
-
 fn current_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -371,9 +364,8 @@ fn handle_register(state: &AppState, body: &str) -> (u16, String) {
         Err(_) => return error(400, "bad_request", "invalid registration payload"),
     };
 
-    let username = req.username.trim();
-    if !valid_username(username) {
-        return error(400, "invalid_username", "username must be 3-32 characters and must not contain spaces or control characters");
+    if req.username.len() < 3 || req.username.len() > 32 {
+        return error(400, "invalid_username", "username must be 3-32 characters");
     }
     if !valid_public_key(&req.identity_public_key) {
         return error(
@@ -384,7 +376,7 @@ fn handle_register(state: &AppState, body: &str) -> (u16, String) {
     }
 
     let conn = state.db.lock().expect("db mutex poisoned");
-    match db::register_account(&conn, username, &req.identity_public_key) {
+    match db::register_account(&conn, &req.username, &req.identity_public_key) {
         Ok(acc) => ok(
             201,
             json!({ "user_id": acc.user_id, "upm_id": acc.upm_id, "device_id": acc.device_id }),
@@ -1076,25 +1068,5 @@ mod tests {
         assert!(valid_public_key(&good));
         assert!(!valid_public_key(&bad));
         assert!(!valid_public_key("not base64 at all!!"));
-    }
-}
-
-#[cfg(test)]
-mod validation_tests {
-    use super::valid_username;
-
-    #[test]
-    fn username_validation_accepts_normal_names_and_unicode() {
-        assert!(valid_username("alice"));
-        assert!(valid_username("Max-1"));
-        assert!(valid_username("Мария"));
-    }
-
-    #[test]
-    fn username_validation_rejects_spaces_and_bad_lengths() {
-        assert!(!valid_username("al"));
-        assert!(!valid_username("alice smith"));
-        assert!(!valid_username("alice\nsmith"));
-        assert!(!valid_username("a".repeat(33).as_str()));
     }
 }

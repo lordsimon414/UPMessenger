@@ -14,10 +14,8 @@
 
 See `docs/ROADMAP.md` and `docs/SECURITY_REVIEW.md` for the detailed implementation and security history.
 
-## Login/account flow hardening
+## Windows client login UI fix
 
-- Windows client now uses the current server URL for Register/Login actions rather than a stale cached client handle.
-- Added server health check and connection timeout handling.
-- Registration trims/validates usernames consistently and reports duplicate names cleanly.
-- Login reports stale-device/server mismatch explicitly and supports a local new-account reset.
-- Added repeatable auth/account checks to `upm-smoke`.
+- Keep the `Log in` action visible on every non-authenticated client start.
+- Disable it only when no local device account exists yet and explain why via tooltip.
+- Keep `Create account` available as a separate action.

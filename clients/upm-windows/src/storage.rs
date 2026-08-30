@@ -89,24 +89,3 @@ pub fn local_secrets_from_bytes(
             .collect(),
     }
 }
-
-
-pub fn clear_secrets() -> Result<(), String> {
-    let entry = Entry::new(SERVICE, SECRETS_ACCOUNT).map_err(|e| e.to_string())?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // keyring providers differ on the error returned for a missing
-            // credential; absence is already the desired state.
-            let msg = e.to_string();
-            if msg.to_ascii_lowercase().contains("not found")
-                || msg.to_ascii_lowercase().contains("no such")
-                || msg.to_ascii_lowercase().contains("cannot find")
-            {
-                Ok(())
-            } else {
-                Err(msg)
-            }
-        }
-    }
-}

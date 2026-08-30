@@ -1,4 +1,4 @@
-use crate::api::{ApiClient, ApiError, DirectoryEntry};
+use crate::api::{ApiClient, DirectoryEntry};
 use crate::identity::LocalIdentity;
 use crate::local_store::{LocalStore, OutboxItem};
 use crate::storage::{self, LocalProfile};
@@ -270,82 +270,34 @@ impl UpmApp {
         app
     }
 
-    fn persist_profile(&self) -> Result<(), String> {
-        storage::save(&self.profile)
-    }
-
-    fn ensure_api(&mut self) -> Result<ApiClient, String> {
-        let server_url = self.profile.server_url.trim();
-        if server_url.is_empty() {
-            return Err("Enter the UPM server URL first".into());
-        }
-        let api = ApiClient::new(server_url).map_err(|e| e.to_string())?;
-        self.api = Some(api.clone());
-        Ok(api)
-    }
-
     fn save(&mut self) {
-        match self.persist_profile() {
-            Ok(_) => {}
+        match storage::save(&self.profile) {
+            Ok(_) => self.status = "Saved".into(),
             Err(e) => self.status = format!("Storage error: {e}"),
         }
         persist_identity_secrets(&self.identity);
     }
 
     fn reconnect(&mut self) {
-        match self.ensure_api() {
-            Ok(api) => {
-                let _ = self.persist_profile();
-                match api.health() {
-                    Ok(()) => self.status = format!("Connected to {}", self.profile.server_url.trim()),
-                    Err(e) => self.status = format!("Server not reachable: {e}"),
-                }
-            }
-            Err(e) => self.status = e,
-        }
+        self.api = ApiClient::new(&self.profile.server_url).ok();
+        self.status = format!("Server set to {}", self.profile.server_url);
     }
 
     fn register(&mut self) {
-        let username = self.profile.username.trim();
-        if username.is_empty() {
-            self.status = "Enter a username first".into();
+        let Some(api) = self.api.clone() else {
+            self.status = "Invalid server URL".into();
             return;
-        }
-        let char_len = username.chars().count();
-        if !(3..=32).contains(&char_len) {
-            self.status = "Username must be 3-32 characters".into();
-            return;
-        }
-        if username.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            self.status = "Username must not contain spaces or control characters".into();
-            return;
-        }
-
-        self.profile.username = username.to_string();
-        let api = match self.ensure_api() {
-            Ok(api) => api,
-            Err(e) => { self.status = e; return; }
         };
-        self.status = "Creating account…".into();
         match api.register(&self.profile.username, &self.identity.identity_public_b64()) {
             Ok(r) => {
                 self.profile.user_id = Some(r.user_id);
                 self.profile.upm_id = Some(r.upm_id.clone());
                 self.profile.device_id = Some(r.device_id);
-                self.profile.session_token = None;
-                self.profile.session_expires_at = None;
-                match self.persist_profile() {
-                    Ok(()) => {
-                        persist_identity_secrets(&self.identity);
-                        self.status = format!("Account created as @{} ({})", self.profile.username, r.upm_id);
-                        self.authenticate();
-                    }
-                    Err(e) => {
-                        self.status = format!("Account created, but local save failed: {e}");
-                    }
-                }
+                self.save();
+                self.status = format!("Registered as {}", r.upm_id);
+                self.authenticate();
             }
-            Err(e) => self.status = format!("Account creation failed: {e}"),
+            Err(e) => self.status = format!("Registration failed: {e}"),
         }
     }
 
@@ -362,78 +314,35 @@ impl UpmApp {
 
     fn authenticate(&mut self) {
         let Some(device_id) = self.profile.device_id.clone() else {
-            self.status = "No local account found — create an account first".into();
+            self.status = "Register first".into();
             return;
         };
-        let api = match self.ensure_api() {
-            Ok(api) => api,
-            Err(e) => { self.status = e; return; }
-        };
-
-        // Never reuse a previously cached bearer token blindly. The challenge
-        // proves possession of the local Ed25519 identity key each time.
-        self.profile.session_token = None;
-        self.profile.session_expires_at = None;
-
-        self.status = "Requesting login challenge…".into();
+        let Some(api) = self.api.clone() else { return };
         let challenge = match api.challenge(&device_id) {
             Ok((c, _)) => c,
-            Err(ApiError::Server { status: 404, .. }) => {
-                self.status = "This device is not registered on this server. Choose ‘New account’ or switch server.".into();
-                return;
-            }
-            Err(e) => { self.status = format!("Login challenge failed: {e}"); return; }
+            Err(e) => { self.status = format!("Challenge failed: {e}"); return; }
         };
-
         let signature = self.identity.signing.sign(&challenge);
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
-        self.status = "Verifying identity…".into();
         match api.verify(&device_id, &signature_b64) {
             Ok(v) => {
                 self.profile.session_token = Some(v.session_token);
                 self.profile.session_expires_at = Some(v.expires_at);
-                if let Err(e) = self.persist_profile() {
-                    self.status = format!("Login succeeded, but local session save failed: {e}");
-                    return;
-                }
+                self.save();
                 let token = self.profile.session_token.clone().unwrap_or_default();
                 if let Err(e) = api.publish_keys(&token, &self.identity.exchange_public_b64(), &self.identity.signed_prekey_public_b64(), &self.identity.signed_prekey_signature_b64()) {
-                    self.status = format!("Login succeeded, but key publication failed: {e}");
+                    self.status = format!("Authenticated, key publish failed: {e}");
                     return;
                 }
                 self.identity.ensure_one_time_prekey_pool(12);
                 persist_identity_secrets(&self.identity);
                 match self.publish_prekeys(&api, &token) {
-                    Ok(()) => self.status = format!("Logged in as @{}", self.profile.username),
-                    Err(e) => self.status = format!("Logged in; signed prekey published, OPK refresh failed: {e}"),
+                    Ok(()) => self.status = format!("Authenticated + X3DH bundle published ({} OPKs)", self.identity.one_time_prekeys.len()),
+                    Err(e) => self.status = format!("Authenticated + signed prekey published; OPK publish failed: {e}"),
                 }
             }
-            Err(ApiError::Server { status: 404, .. }) => {
-                self.status = "Login failed: device/account not found on this server".into();
-            }
-            Err(ApiError::Server { status: 401, .. }) => {
-                self.status = "Login failed: identity signature rejected".into();
-            }
-            Err(e) => self.status = format!("Login failed: {e}"),
+            Err(e) => self.status = format!("Authentication failed: {e}"),
         }
-    }
-
-    fn new_local_account(&mut self) {
-        self.profile.user_id = None;
-        self.profile.upm_id = None;
-        self.profile.device_id = None;
-        self.profile.session_token = None;
-        self.profile.session_expires_at = None;
-        self.profile.username.clear();
-        self.directory = None;
-        self.conversation = None;
-        self.message_input.clear();
-        self.new_contact.clear();
-        let _ = storage::clear();
-        let _ = storage::clear_secrets();
-        self.identity = LocalIdentity::generate();
-        persist_identity_secrets(&self.identity);
-        self.status = "Local account cleared. Enter a username and create a new account.".into();
     }
 
     fn update_directory_visibility(&mut self) {
@@ -830,11 +739,20 @@ impl eframe::App for UpmApp {
                 ui.horizontal_wrapped(|ui| {
                     if authenticated {
                         if ui.button("Log out").clicked() { self.logout(); }
-                    } else if has_account {
-                        if ui.button("Log in").clicked() { self.authenticate(); }
-                        if ui.small_button("New account").clicked() { self.new_local_account(); }
                     } else {
-                        if ui.button("Register").clicked() { self.register(); }
+                        // Keep the Login action visible at all times so a fresh
+                        // install does not look like login is missing. On a
+                        // truly fresh install there is no local device_id yet,
+                        // so the button remains disabled until an account has
+                        // been created on this device.
+                        ui.add_enabled_ui(has_account, |ui| {
+                            let response = ui.button("Log in");
+                            if response.clicked() { self.authenticate(); }
+                            if !has_account {
+                                response.on_hover_text("Create an account on this device first.");
+                            }
+                        });
+                        if ui.button("Create account").clicked() { self.register(); }
                     }
                 });
                 ui.add_space(6.0);

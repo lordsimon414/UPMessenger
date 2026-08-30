@@ -61,5 +61,3 @@ cargo run -p upm-smoke -- http://127.0.0.1:8787
 ```
 
 The smoke test deliberately does not claim to prove the cryptographic ratchet; it verifies the server's registration, challenge-response authentication, opaque envelope routing, protocol version handling, and recipient-scoped ACK behavior.
-
-- Login/account creation troubleshooting: `docs/LOGIN_DEBUG.md`

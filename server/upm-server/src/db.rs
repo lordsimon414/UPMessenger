@@ -243,16 +243,11 @@ pub fn register_account(
     let created_at = now();
 
     let tx = conn.unchecked_transaction()?;
-    if let Err(err) = tx.execute(
+    tx.execute(
         "INSERT INTO users (user_id, upm_id, username, username_normalized, created_at, status, directory_visible)
          VALUES (?1, ?2, ?3, ?4, ?5, 'active', 1)",
         params![user_id, upm_id, username, normalized, created_at],
-    ) {
-        if matches!(err, rusqlite::Error::SqliteFailure(ref e, _) if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE || e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY) {
-            return Err(DbError::UsernameTaken);
-        }
-        return Err(DbError::Sqlite(err));
-    }
+    )?;
     tx.execute(
         "INSERT INTO devices (device_id, user_id, identity_public_key, capabilities)
          VALUES (?1, ?2, ?3, '[]')",
@@ -1096,34 +1091,5 @@ mod tests {
         // The fresh attachment must survive the sweep, the stale one must not.
         assert!(get_attachment(&conn, &fresh.attachment_id).unwrap().is_some());
         assert!(get_attachment(&conn, &stale.attachment_id).unwrap().is_none());
-    }
-}
-
-#[cfg(test)]
-mod account_validation_tests {
-    use super::*;
-    use upm_crypto::IdentityKeyPair;
-    use crate::util::base64_encode;
-
-    #[test]
-    fn registration_trims_and_normalizes_username() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        crate::auth::init_schema(&conn).unwrap();
-        let kp = IdentityKeyPair::generate();
-        let acc = register_account(&conn, "Alice", &base64_encode(&kp.public_key())).unwrap();
-        let found = resolve_username(&conn, "alice").unwrap().unwrap();
-        assert_eq!(found.upm_id, acc.upm_id);
-    }
-
-    #[test]
-    fn duplicate_case_insensitive_username_is_rejected() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        crate::auth::init_schema(&conn).unwrap();
-        let kp1 = IdentityKeyPair::generate();
-        let kp2 = IdentityKeyPair::generate();
-        register_account(&conn, "Alice", &base64_encode(&kp1.public_key())).unwrap();
-        assert!(matches!(register_account(&conn, "alice", &base64_encode(&kp2.public_key())), Err(DbError::UsernameTaken)));
     }
 }

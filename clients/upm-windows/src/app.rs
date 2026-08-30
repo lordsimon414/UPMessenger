@@ -506,6 +506,27 @@ impl UpmApp {
         }
     }
 
+    fn reset_secure_session(&mut self) {
+        let Some(conversation) = self.conversation.as_ref() else {
+            self.status = "Resolve a contact first".into();
+            return;
+        };
+        let peer_device = conversation.peer.device_id.clone();
+        if let Some(store) = &self.local_store {
+            match store.reset_session(&peer_device) {
+                Ok(()) => {
+                    if let Some(current) = &mut self.conversation {
+                        current.session = None;
+                    }
+                    self.status = "Secure session reset. Ask the contact to send a new message.".into();
+                }
+                Err(e) => self.status = format!("Secure session reset failed: {e}"),
+            }
+        } else {
+            self.status = "Local secure store is unavailable".into();
+        }
+    }
+
     fn send_message(&mut self) {
         let text = self.message_input.trim().to_string();
         if text.is_empty() { return; }
@@ -627,7 +648,9 @@ impl UpmApp {
                     continue;
                 }
                 Err(e) => {
-                    self.status = format!("Message authentication failed: {e}");
+                    self.status = format!(
+                        "Message authentication failed: {e}. If one side was reinstalled, reset, or lost its session, use Reset secure session and have the contact send a new message."
+                    );
                     continue;
                 }
             };
@@ -816,6 +839,15 @@ impl eframe::App for UpmApp {
                             .show(ui, |ui| {
                                 ui.small(egui::RichText::new(safety_number(&my_key, &their_key)).monospace());
                             });
+                    }
+                    if self.conversation.as_ref().and_then(|c| c.session.as_ref()).is_some() {
+                        ui.add_space(6.0);
+                        if ui.button("Reset secure session").clicked() {
+                            self.reset_secure_session();
+                        }
+                        ui.small(egui::RichText::new(
+                            "Use this after a reinstall/session loss. Chat history is kept; pending messages from the old session are discarded.",
+                        ).weak());
                     }
                 }
             });

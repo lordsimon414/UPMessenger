@@ -159,6 +159,34 @@ impl LocalStore {
         Ok(out)
     }
 
+    /// Drops the ratchet session for one peer without deleting encrypted chat history.
+    /// Existing outbox items for that peer are also removed because they were
+    /// encrypted under the old session and MUST NOT be replayed after a manual
+    /// session reset.
+    pub fn reset_session(&self, peer_device_id: &str) -> Result<(), LocalStoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM sessions WHERE peer_device_id = ?1", params![peer_device_id])?;
+        let mut stmt = tx.prepare("SELECT message_id, encrypted_record FROM outbox")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let (message_id, blob) = row?;
+            let plaintext = self.decrypt_record(&blob)?;
+            let item: OutboxItem = serde_json::from_slice(&plaintext)?;
+            if item.peer_device_id == peer_device_id {
+                ids.push(message_id);
+            }
+        }
+        drop(stmt);
+        for id in ids {
+            tx.execute("DELETE FROM outbox WHERE message_id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_outbox(&self, message_id: MessageId) -> Result<(), LocalStoreError> {
         self.conn.execute(
             "DELETE FROM outbox WHERE message_id = ?1",
@@ -397,6 +425,49 @@ mod tests {
         assert!(store.pin_or_verify_peer("A", "KEY1").unwrap());
         assert!(store.pin_or_verify_peer("A", "KEY1").unwrap());
         assert!(!store.pin_or_verify_peer("A", "KEY2").unwrap());
+    }
+
+    #[test]
+    fn reset_session_removes_session_and_matching_outbox_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_device_id TEXT NOT NULL, direction INTEGER NOT NULL, created_at INTEGER NOT NULL, encrypted_text BLOB NOT NULL); CREATE TABLE sessions (peer_device_id TEXT PRIMARY KEY, encrypted_state BLOB NOT NULL, updated_at INTEGER NOT NULL); CREATE TABLE peer_identities (peer_device_id TEXT PRIMARY KEY, identity_public_key TEXT NOT NULL, pinned_at INTEGER NOT NULL); CREATE TABLE outbox (message_id TEXT PRIMARY KEY, encrypted_record BLOB NOT NULL, created_at INTEGER NOT NULL); CREATE TABLE processed_messages (message_id TEXT PRIMARY KEY, peer_device_id TEXT NOT NULL, processed_at INTEGER NOT NULL);").unwrap();
+        let store = LocalStore { conn, key: [9u8; DB_KEY_LEN] };
+        let snapshot = SessionSnapshot {
+            protocol_version: upm_protocol::ProtocolVersion::CURRENT,
+            peer_device: upm_protocol::DeviceId([2; 16]),
+            root_key: [0; 32],
+            dh_self_private: [1; 32],
+            dh_remote_public: None,
+            sending_chain_key: None,
+            receiving_chain_key: None,
+            send_count: 0,
+            recv_count: 0,
+            prev_chain_len: 0,
+            skipped: Vec::new(),
+        };
+        let session = DoubleRatchetSession::from_snapshot(snapshot).unwrap();
+        store.save_session("PEER-A", &session, 1).unwrap();
+        store.save_session("PEER-B", &session, 1).unwrap();
+        let item = OutboxItem {
+            message_id: MessageId([4; 16]),
+            peer_device_id: "PEER-A".into(),
+            envelope: MessageEnvelope {
+                protocol_version: upm_protocol::ProtocolVersion::CURRENT,
+                message_id: MessageId([4; 16]),
+                sender_device_id: upm_protocol::DeviceId([1; 16]),
+                recipient_device_id: upm_protocol::DeviceId([2; 16]),
+                ciphertext: vec![1],
+                server_timestamp: 1,
+                expires_at: 2,
+            },
+            session_after: session.snapshot(),
+            text: "pending".into(),
+        };
+        store.save_outbox(&item).unwrap();
+        store.reset_session("PEER-A").unwrap();
+        assert!(store.load_session("PEER-A").unwrap().is_none());
+        assert!(store.load_session("PEER-B").unwrap().is_some());
+        assert!(store.load_outbox().unwrap().is_empty());
     }
 
     #[test]

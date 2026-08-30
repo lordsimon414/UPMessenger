@@ -19,3 +19,5 @@ See `docs/ROADMAP.md` and `docs/SECURITY_REVIEW.md` for the detailed implementat
 - Keep the `Log in` action visible on every non-authenticated client start.
 - Disable it only when no local device account exists yet and explain why via tooltip.
 - Keep `Create account` available as a separate action.
+
+- Windows client: added an explicit **Reset secure session** action and clearer guidance when ratchet authentication fails, to recover safely from stale persistent session state without deleting encrypted chat history.

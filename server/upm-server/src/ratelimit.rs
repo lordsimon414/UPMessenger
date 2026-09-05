@@ -28,7 +28,10 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 struct Window {
@@ -45,7 +48,12 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(limit: u32, window_secs: u64) -> Self {
-        RateLimiter { limit, window_secs, max_tracked_keys: 10_000, state: Mutex::new(HashMap::new()) }
+        RateLimiter {
+            limit,
+            window_secs,
+            max_tracked_keys: 10_000,
+            state: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Records one call for `key` and returns whether it's within budget
@@ -62,7 +70,10 @@ impl RateLimiter {
             }
         }
 
-        let entry = state.entry(key.to_string()).or_insert(Window { window_start: now, count: 0 });
+        let entry = state.entry(key.to_string()).or_insert(Window {
+            window_start: now,
+            count: 0,
+        });
         if now.saturating_sub(entry.window_start) >= self.window_secs {
             entry.window_start = now;
             entry.count = 0;
@@ -82,14 +93,20 @@ mod tests {
         assert!(limiter.check("a"));
         assert!(limiter.check("a"));
         assert!(limiter.check("a"));
-        assert!(!limiter.check("a"), "4th call within the window must be blocked");
+        assert!(
+            !limiter.check("a"),
+            "4th call within the window must be blocked"
+        );
     }
 
     #[test]
     fn keys_are_independent() {
         let limiter = RateLimiter::new(1, 60);
         assert!(limiter.check("alice"));
-        assert!(limiter.check("bob"), "a different key must have its own budget");
+        assert!(
+            limiter.check("bob"),
+            "a different key must have its own budget"
+        );
         assert!(!limiter.check("alice"));
     }
 
@@ -97,6 +114,9 @@ mod tests {
     fn window_resets_after_expiry() {
         let limiter = RateLimiter::new(1, 0); // 0-second window: every call is a new window
         assert!(limiter.check("a"));
-        assert!(limiter.check("a"), "a zero-length window should reset immediately");
+        assert!(
+            limiter.check("a"),
+            "a zero-length window should reset immediately"
+        );
     }
 }

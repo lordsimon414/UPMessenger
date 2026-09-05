@@ -40,7 +40,6 @@ pub fn clear() -> Result<(), String> {
     entry.delete_credential().map_err(|e| e.to_string())
 }
 
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredOneTimePreKey {
     pub id: PreKeyId,
@@ -85,7 +84,10 @@ pub fn local_secrets_from_bytes(
         signed_prekey_private_b64: enc.encode(signed_prekey),
         one_time_prekeys: one_time_prekeys
             .into_iter()
-            .map(|(id, key)| StoredOneTimePreKey { id, private_b64: enc.encode(key) })
+            .map(|(id, key)| StoredOneTimePreKey {
+                id,
+                private_b64: enc.encode(key),
+            })
             .collect(),
     }
 }

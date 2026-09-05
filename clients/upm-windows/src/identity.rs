@@ -51,9 +51,11 @@ impl LocalIdentity {
             .iter()
             .map(|entry| {
                 let public = entry.secret.public_key();
-                let signature = self
-                    .signing
-                    .sign(&upm_core::handshake::one_time_prekey_signature_message(entry.id, &public));
+                let signature =
+                    self.signing
+                        .sign(&upm_core::handshake::one_time_prekey_signature_message(
+                            entry.id, &public,
+                        ));
                 (
                     entry.id,
                     base64::engine::general_purpose::STANDARD.encode(public),
@@ -77,7 +79,8 @@ impl LocalIdentity {
     pub fn ensure_one_time_prekey_pool(&mut self, target: usize) {
         let missing = target.saturating_sub(self.one_time_prekeys.len());
         if missing > 0 {
-            self.one_time_prekeys.extend(Self::generate_one_time_prekeys(missing));
+            self.one_time_prekeys
+                .extend(Self::generate_one_time_prekeys(missing));
         }
     }
 

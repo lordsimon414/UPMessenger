@@ -80,9 +80,8 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
                 )",
             )?;
             let tokens: Vec<(String, String, i64, i64)> = {
-                let mut stmt = conn.prepare(
-                    "SELECT token, device_id, created_at, expires_at FROM sessions",
-                )?;
+                let mut stmt =
+                    conn.prepare("SELECT token, device_id, created_at, expires_at FROM sessions")?;
                 let rows = stmt.query_map([], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })?;
@@ -131,15 +130,12 @@ fn random_bytes(n: usize) -> Vec<u8> {
 }
 
 fn random_token() -> String {
-    random_bytes(32)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    crate::util::hex_encode(&random_bytes(32), false)
 }
 
 fn token_digest(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    crate::util::hex_encode(&digest, false)
 }
 
 /// Issues (or replaces) a one-time challenge nonce for `device_id`.
@@ -235,7 +231,10 @@ pub fn authenticate(conn: &Connection, token: &str) -> Result<String, AuthError>
         .optional()?;
     let (device_id, expires_at) = row.ok_or(AuthError::InvalidSession)?;
     if now() > expires_at {
-        conn.execute("DELETE FROM sessions WHERE token_hash = ?1", params![token_digest(token)])?;
+        conn.execute(
+            "DELETE FROM sessions WHERE token_hash = ?1",
+            params![token_digest(token)],
+        )?;
         return Err(AuthError::InvalidSession);
     }
     Ok(device_id)
@@ -321,7 +320,11 @@ mod tests {
         let (token, _) = verify_and_issue_session(&conn, &device_id, &signature).unwrap();
 
         let plain_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'token'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'token'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(plain_count, 0);
         let stored_hash: String = conn
@@ -339,7 +342,10 @@ mod tests {
         let (token, _) = verify_and_issue_session(&conn, &device_id, &signature).unwrap();
         assert_eq!(authenticate(&conn, &token).unwrap(), device_id);
         revoke_session(&conn, &token).unwrap();
-        assert!(matches!(authenticate(&conn, &token), Err(AuthError::InvalidSession)));
+        assert!(matches!(
+            authenticate(&conn, &token),
+            Err(AuthError::InvalidSession)
+        ));
     }
 
     #[test]

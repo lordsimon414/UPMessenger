@@ -20,7 +20,11 @@ impl AttachmentKey {
     }
 }
 
-pub fn encrypt(key: AttachmentKey, attachment_id: MessageId, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+pub fn encrypt(
+    key: AttachmentKey,
+    attachment_id: MessageId,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     let mut nonce = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce);
     let aead_key = AeadKey::from_bytes(key.0);
@@ -31,7 +35,11 @@ pub fn encrypt(key: AttachmentKey, attachment_id: MessageId, plaintext: &[u8]) -
     Ok(blob)
 }
 
-pub fn decrypt(key: AttachmentKey, attachment_id: MessageId, blob: &[u8]) -> Result<Vec<u8>, CryptoError> {
+pub fn decrypt(
+    key: AttachmentKey,
+    attachment_id: MessageId,
+    blob: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     if blob.len() < NONCE_LEN {
         return Err(CryptoError::Aead);
     }

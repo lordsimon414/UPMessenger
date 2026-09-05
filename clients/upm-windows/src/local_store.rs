@@ -93,18 +93,34 @@ impl LocalStore {
         })
     }
 
+    /// Loads decrypted message history for `peer`. A record that fails to
+    /// decrypt (e.g. the local encryption key was lost/reset — see
+    /// `load_or_create_db_key`'s doc comment) is skipped rather than
+    /// aborting the whole load: previously, one corrupted row made this
+    /// return `Err` and the conversation view could never open again,
+    /// even for brand-new messages that arrived *after* the key was
+    /// reset. Skipping means older history may have gaps, but new
+    /// messages keep working.
     pub fn load_messages(&self, peer: &str) -> Result<Vec<(bool, String, i64)>, LocalStoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT direction, encrypted_text, created_at FROM messages WHERE peer_device_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![peer], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
             let (direction, blob, created_at) = row?;
-            let plaintext = self.decrypt_record(&blob)?;
-            let stored: StoredMessage = serde_json::from_slice(&plaintext)?;
+            let Ok(plaintext) = self.decrypt_record(&blob) else {
+                continue;
+            };
+            let Ok(stored) = serde_json::from_slice::<StoredMessage>(&plaintext) else {
+                continue;
+            };
             out.push((direction == 1, stored.text, created_at));
         }
         Ok(out)
@@ -157,34 +173,6 @@ impl LocalStore {
             out.push(serde_json::from_slice(&plaintext)?);
         }
         Ok(out)
-    }
-
-    /// Drops the ratchet session for one peer without deleting encrypted chat history.
-    /// Existing outbox items for that peer are also removed because they were
-    /// encrypted under the old session and MUST NOT be replayed after a manual
-    /// session reset.
-    pub fn reset_session(&self, peer_device_id: &str) -> Result<(), LocalStoreError> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM sessions WHERE peer_device_id = ?1", params![peer_device_id])?;
-        let mut stmt = tx.prepare("SELECT message_id, encrypted_record FROM outbox")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        let mut ids = Vec::new();
-        for row in rows {
-            let (message_id, blob) = row?;
-            let plaintext = self.decrypt_record(&blob)?;
-            let item: OutboxItem = serde_json::from_slice(&plaintext)?;
-            if item.peer_device_id == peer_device_id {
-                ids.push(message_id);
-            }
-        }
-        drop(stmt);
-        for id in ids {
-            tx.execute("DELETE FROM outbox WHERE message_id = ?1", params![id])?;
-        }
-        tx.commit()?;
-        Ok(())
     }
 
     pub fn delete_outbox(&self, message_id: MessageId) -> Result<(), LocalStoreError> {
@@ -259,10 +247,8 @@ impl LocalStore {
             created_at,
         };
         let message_blob = encrypt_record_with_key(self.key, &serde_json::to_vec(&stored)?)?;
-        let snapshot_blob = encrypt_record_with_key(
-            self.key,
-            &serde_json::to_vec(&session.snapshot())?,
-        )?;
+        let snapshot_blob =
+            encrypt_record_with_key(self.key, &serde_json::to_vec(&session.snapshot())?)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO messages(peer_device_id, direction, created_at, encrypted_text) VALUES (?1, 0, ?2, ?3)",
@@ -320,6 +306,16 @@ impl LocalStore {
         Ok(())
     }
 
+    /// Loads and decrypts the persisted ratchet session for `peer_device_id`,
+    /// if one exists. A snapshot that fails to decrypt or parse (e.g. the
+    /// local encryption key was lost/reset — see `load_or_create_db_key`'s
+    /// doc comment) is treated the same as "no session yet" (`Ok(None)`)
+    /// rather than propagated as an error: unlike message history, there's
+    /// no meaningful "partial" ratchet state to salvage, but returning
+    /// `None` here safely falls into the same "establish a fresh session"
+    /// path a brand-new conversation already takes — instead of the
+    /// conversation becoming permanently unusable because one corrupted
+    /// row blocks it from ever opening.
     pub fn load_session(
         &self,
         peer_device_id: &str,
@@ -333,11 +329,16 @@ impl LocalStore {
             )
             .optional()?;
         let Some(blob) = blob else { return Ok(None) };
-        let plaintext = self.decrypt_record(&blob)?;
-        let snapshot: SessionSnapshot = serde_json::from_slice(&plaintext)?;
-        DoubleRatchetSession::from_snapshot(snapshot)
-            .map(Some)
-            .map_err(|e| LocalStoreError::Session(e.to_string()))
+        let Ok(plaintext) = self.decrypt_record(&blob) else {
+            return Ok(None);
+        };
+        let Ok(snapshot) = serde_json::from_slice::<SessionSnapshot>(&plaintext) else {
+            return Ok(None);
+        };
+        match DoubleRatchetSession::from_snapshot(snapshot) {
+            Ok(session) => Ok(Some(session)),
+            Err(_) => Ok(None),
+        }
     }
 
     fn encrypt_record(&self, plaintext: &[u8]) -> Result<Vec<u8>, LocalStoreError> {
@@ -421,60 +422,23 @@ mod tests {
     fn peer_identity_is_pinned_and_changes_are_detected() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE peer_identities (peer_device_id TEXT PRIMARY KEY, identity_public_key TEXT NOT NULL, pinned_at INTEGER NOT NULL);").unwrap();
-        let store = LocalStore { conn, key: [7u8; DB_KEY_LEN] };
+        let store = LocalStore {
+            conn,
+            key: [7u8; DB_KEY_LEN],
+        };
         assert!(store.pin_or_verify_peer("A", "KEY1").unwrap());
         assert!(store.pin_or_verify_peer("A", "KEY1").unwrap());
         assert!(!store.pin_or_verify_peer("A", "KEY2").unwrap());
     }
 
     #[test]
-    fn reset_session_removes_session_and_matching_outbox_only() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_device_id TEXT NOT NULL, direction INTEGER NOT NULL, created_at INTEGER NOT NULL, encrypted_text BLOB NOT NULL); CREATE TABLE sessions (peer_device_id TEXT PRIMARY KEY, encrypted_state BLOB NOT NULL, updated_at INTEGER NOT NULL); CREATE TABLE peer_identities (peer_device_id TEXT PRIMARY KEY, identity_public_key TEXT NOT NULL, pinned_at INTEGER NOT NULL); CREATE TABLE outbox (message_id TEXT PRIMARY KEY, encrypted_record BLOB NOT NULL, created_at INTEGER NOT NULL); CREATE TABLE processed_messages (message_id TEXT PRIMARY KEY, peer_device_id TEXT NOT NULL, processed_at INTEGER NOT NULL);").unwrap();
-        let store = LocalStore { conn, key: [9u8; DB_KEY_LEN] };
-        let snapshot = SessionSnapshot {
-            protocol_version: upm_protocol::ProtocolVersion::CURRENT,
-            peer_device: upm_protocol::DeviceId([2; 16]),
-            root_key: [0; 32],
-            dh_self_private: [1; 32],
-            dh_remote_public: None,
-            sending_chain_key: None,
-            receiving_chain_key: None,
-            send_count: 0,
-            recv_count: 0,
-            prev_chain_len: 0,
-            skipped: Vec::new(),
-        };
-        let session = DoubleRatchetSession::from_snapshot(snapshot).unwrap();
-        store.save_session("PEER-A", &session, 1).unwrap();
-        store.save_session("PEER-B", &session, 1).unwrap();
-        let item = OutboxItem {
-            message_id: MessageId([4; 16]),
-            peer_device_id: "PEER-A".into(),
-            envelope: MessageEnvelope {
-                protocol_version: upm_protocol::ProtocolVersion::CURRENT,
-                message_id: MessageId([4; 16]),
-                sender_device_id: upm_protocol::DeviceId([1; 16]),
-                recipient_device_id: upm_protocol::DeviceId([2; 16]),
-                ciphertext: vec![1],
-                server_timestamp: 1,
-                expires_at: 2,
-            },
-            session_after: session.snapshot(),
-            text: "pending".into(),
-        };
-        store.save_outbox(&item).unwrap();
-        store.reset_session("PEER-A").unwrap();
-        assert!(store.load_session("PEER-A").unwrap().is_none());
-        assert!(store.load_session("PEER-B").unwrap().is_some());
-        assert!(store.load_outbox().unwrap().is_empty());
-    }
-
-    #[test]
     fn processed_message_marker_survives_commit() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_device_id TEXT NOT NULL, direction INTEGER NOT NULL, created_at INTEGER NOT NULL, encrypted_text BLOB NOT NULL); CREATE TABLE sessions (peer_device_id TEXT PRIMARY KEY, encrypted_state BLOB NOT NULL, updated_at INTEGER NOT NULL); CREATE TABLE processed_messages (message_id TEXT PRIMARY KEY, peer_device_id TEXT NOT NULL, processed_at INTEGER NOT NULL);").unwrap();
-        let store = LocalStore { conn, key: [8u8; DB_KEY_LEN] };
+        let store = LocalStore {
+            conn,
+            key: [8u8; DB_KEY_LEN],
+        };
         let snapshot = SessionSnapshot {
             protocol_version: upm_protocol::ProtocolVersion::CURRENT,
             peer_device: upm_protocol::DeviceId([2; 16]),
@@ -490,8 +454,99 @@ mod tests {
         };
         let session = DoubleRatchetSession::from_snapshot(snapshot).unwrap();
         let id = MessageId([3; 16]);
-        store.commit_incoming_message("PEER", id, "hello", &session, 1).unwrap();
+        store
+            .commit_incoming_message("PEER", id, "hello", &session, 1)
+            .unwrap();
         assert!(store.is_message_processed(id, "PEER").unwrap());
         assert!(!store.is_message_processed(id, "OTHER").unwrap());
+    }
+
+    #[test]
+    fn load_messages_skips_a_corrupted_record_instead_of_failing_entirely() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_device_id TEXT NOT NULL, direction INTEGER NOT NULL, created_at INTEGER NOT NULL, encrypted_text BLOB NOT NULL);").unwrap();
+        let store = LocalStore {
+            conn,
+            key: [9u8; DB_KEY_LEN],
+        };
+
+        let good_blob = store
+            .encrypt_record(
+                serde_json::to_vec(&StoredMessage {
+                    peer_device_id: "PEER".into(),
+                    direction: 1,
+                    text: "hello".into(),
+                    created_at: 100,
+                })
+                .unwrap()
+                .as_slice(),
+            )
+            .unwrap();
+        store.conn.execute(
+            "INSERT INTO messages (peer_device_id, direction, created_at, encrypted_text) VALUES (?1, 1, 100, ?2)",
+            params!["PEER", good_blob],
+        ).unwrap();
+        // Simulates the local encryption key having been lost/reset: this
+        // blob is not decryptable with the store's current key at all.
+        store.conn.execute(
+            "INSERT INTO messages (peer_device_id, direction, created_at, encrypted_text) VALUES (?1, 1, 200, ?2)",
+            params!["PEER", vec![0xFFu8; 40]],
+        ).unwrap();
+        let good_blob_2 = store
+            .encrypt_record(
+                serde_json::to_vec(&StoredMessage {
+                    peer_device_id: "PEER".into(),
+                    direction: 0,
+                    text: "still works".into(),
+                    created_at: 300,
+                })
+                .unwrap()
+                .as_slice(),
+            )
+            .unwrap();
+        store.conn.execute(
+            "INSERT INTO messages (peer_device_id, direction, created_at, encrypted_text) VALUES (?1, 0, 300, ?2)",
+            params!["PEER", good_blob_2],
+        ).unwrap();
+
+        let loaded = store.load_messages("PEER").unwrap();
+        let texts: Vec<&str> = loaded.iter().map(|(_, text, _)| text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["hello", "still works"],
+            "the corrupted middle record should be skipped, not abort the whole load"
+        );
+    }
+
+    #[test]
+    fn load_session_returns_none_for_an_undecryptable_snapshot() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE sessions (peer_device_id TEXT PRIMARY KEY, encrypted_state BLOB NOT NULL, updated_at INTEGER NOT NULL);").unwrap();
+        let store = LocalStore {
+            conn,
+            key: [10u8; DB_KEY_LEN],
+        };
+        store.conn.execute(
+            "INSERT INTO sessions (peer_device_id, encrypted_state, updated_at) VALUES (?1, ?2, 0)",
+            params!["PEER", vec![0xAAu8; 40]],
+        ).unwrap();
+
+        // Must NOT be an error — a corrupted/undecryptable snapshot should
+        // be treated the same as "no session recorded yet", so the caller
+        // falls into the normal fresh-handshake path instead of the
+        // conversation becoming permanently stuck.
+        let result = store.load_session("PEER").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn load_session_returns_none_when_none_was_ever_stored() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE sessions (peer_device_id TEXT PRIMARY KEY, encrypted_state BLOB NOT NULL, updated_at INTEGER NOT NULL);").unwrap();
+        let store = LocalStore {
+            conn,
+            key: [11u8; DB_KEY_LEN],
+        };
+        assert!(store.load_session("NOBODY").unwrap().is_none());
     }
 }

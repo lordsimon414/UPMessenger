@@ -46,7 +46,9 @@ pub struct IdentityKeyPair {
 /// harmless.
 impl std::fmt::Debug for IdentityKeyPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IdentityKeyPair").field("public_key", &self.public_key()).finish_non_exhaustive()
+        f.debug_struct("IdentityKeyPair")
+            .field("public_key", &self.public_key())
+            .finish_non_exhaustive()
     }
 }
 
@@ -70,7 +72,9 @@ impl IdentityKeyPair {
 
     /// Restores an Ed25519 identity key from OS-protected client storage.
     pub fn from_private_key_bytes(bytes: [u8; 32]) -> Self {
-        Self { signing_key: SigningKey::from_bytes(&bytes) }
+        Self {
+            signing_key: SigningKey::from_bytes(&bytes),
+        }
     }
 
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
@@ -103,7 +107,9 @@ pub struct AgreementSecret(x25519_dalek::StaticSecret);
 /// `IdentityKeyPair` above: never print the private scalar.
 impl std::fmt::Debug for AgreementSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgreementSecret").field("public_key", &self.public_key()).finish_non_exhaustive()
+        f.debug_struct("AgreementSecret")
+            .field("public_key", &self.public_key())
+            .finish_non_exhaustive()
     }
 }
 

@@ -13,7 +13,9 @@ use upm_protocol::PreKeyId;
 pub enum HandshakeError {
     #[error("signed prekey signature does not verify against the published identity signing key")]
     InvalidPrekeySignature,
-    #[error("one-time prekey signature does not verify against the published identity signing key")]
+    #[error(
+        "one-time prekey signature does not verify against the published identity signing key"
+    )]
     InvalidOneTimePrekeySignature,
     #[error("one-time prekey id/public key/signature must either all be present or all be absent")]
     InvalidOneTimePrekeyBundle,
@@ -42,10 +44,7 @@ fn signed_prekey_signature_message(
     message
 }
 
-pub fn one_time_prekey_signature_message(
-    id: PreKeyId,
-    public_key: &[u8; 32],
-) -> Vec<u8> {
+pub fn one_time_prekey_signature_message(id: PreKeyId, public_key: &[u8; 32]) -> Vec<u8> {
     let mut message = Vec::with_capacity(24 + 16 + 32);
     message.extend_from_slice(b"UPM/v4/one-time-prekey/");
     message.extend_from_slice(&id.0);
@@ -87,7 +86,12 @@ pub struct HandshakeResult {
     pub receiving_chain_key: [u8; 32],
 }
 
-fn derive_chains(ikm: &[u8]) -> Result<([u8; 32], [u8; 32], [u8; 32]), CryptoError> {
+/// `(root_key, chain_a_to_b, chain_b_to_a)` — named here purely to satisfy
+/// clippy's type-complexity lint on the raw triple-tuple; carries no
+/// additional semantics beyond `derive_chains`'s own doc comment.
+type DerivedChains = ([u8; 32], [u8; 32], [u8; 32]);
+
+fn derive_chains(ikm: &[u8]) -> Result<DerivedChains, CryptoError> {
     const SALT: &[u8] = b"upm/v4/x3dh/salt";
     let mut root_key = [0u8; 32];
     upm_crypto::derive(SALT, ikm, b"upm/v4/x3dh/root-key", &mut root_key)?;
@@ -171,7 +175,12 @@ mod tests {
     use super::*;
     use upm_crypto::IdentityKeyPair;
 
-    fn make_bob_bundle() -> (PreKeyBundle, AgreementSecret, AgreementSecret, AgreementSecret) {
+    fn make_bob_bundle() -> (
+        PreKeyBundle,
+        AgreementSecret,
+        AgreementSecret,
+        AgreementSecret,
+    ) {
         let identity_signing = IdentityKeyPair::generate();
         let identity_exchange = AgreementSecret::generate();
         let signed_prekey = AgreementSecret::generate();
@@ -211,8 +220,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(alice_hs.result.root_key, bob_hs.root_key);
-        assert_eq!(alice_hs.result.sending_chain_key, bob_hs.receiving_chain_key);
-        assert_eq!(alice_hs.result.receiving_chain_key, bob_hs.sending_chain_key);
+        assert_eq!(
+            alice_hs.result.sending_chain_key,
+            bob_hs.receiving_chain_key
+        );
+        assert_eq!(
+            alice_hs.result.receiving_chain_key,
+            bob_hs.sending_chain_key
+        );
         assert_eq!(alice_hs.one_time_prekey_id, Some(PreKeyId([0x55; 16])));
     }
 

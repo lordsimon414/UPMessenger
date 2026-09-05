@@ -155,11 +155,13 @@ impl DoubleRatchetSession {
         let skipped = self
             .skipped
             .iter()
-            .map(|((dh_pub, message_number), message_key)| SkippedMessageKey {
-                dh_pub: *dh_pub,
-                message_number: *message_number,
-                message_key: *message_key,
-            })
+            .map(
+                |((dh_pub, message_number), message_key)| SkippedMessageKey {
+                    dh_pub: *dh_pub,
+                    message_number: *message_number,
+                    message_key: *message_key,
+                },
+            )
             .collect();
         SessionSnapshot {
             protocol_version: self.protocol_version,
@@ -316,12 +318,7 @@ impl DoubleRatchetSession {
         if let Some(message_key) = self.skipped.get(&(header.dh_pub, header.n)).copied() {
             let aad = serde_json::to_vec(header).map_err(|_| WireError::Encoding)?;
             let key = AeadKey::from_bytes(message_key);
-            let plaintext = upm_crypto::decrypt(
-                &key,
-                &[0u8; 12],
-                &ciphertext_bytes,
-                &aad,
-            )?;
+            let plaintext = upm_crypto::decrypt(&key, &[0u8; 12], &ciphertext_bytes, &aad)?;
             self.skipped.remove(&(header.dh_pub, header.n));
             return Ok(plaintext);
         }
@@ -339,12 +336,16 @@ impl DoubleRatchetSession {
             self.dh_ratchet_step(header.dh_pub)?;
         }
 
-        if header.n > self.recv_count {
-            self.skip_receiving_keys(header.dh_pub, header.n)?;
-        } else if header.n < self.recv_count {
-            // Would have been served by the skipped-key map above; if it
-            // wasn't there, this is a genuine replay/duplicate.
-            return Err(SessionError::Replay);
+        match header.n.cmp(&self.recv_count) {
+            std::cmp::Ordering::Greater => {
+                self.skip_receiving_keys(header.dh_pub, header.n)?;
+            }
+            std::cmp::Ordering::Less => {
+                // Would have been served by the skipped-key map above; if
+                // it wasn't there, this is a genuine replay/duplicate.
+                return Err(SessionError::Replay);
+            }
+            std::cmp::Ordering::Equal => {}
         }
 
         let chain_key = self
@@ -353,12 +354,7 @@ impl DoubleRatchetSession {
         let (next_chain_key, message_key) = kdf_ck(&chain_key)?;
         let aad = serde_json::to_vec(header).map_err(|_| WireError::Encoding)?;
         let key = AeadKey::from_bytes(message_key);
-        let plaintext = upm_crypto::decrypt(
-            &key,
-            &[0u8; 12],
-            &ciphertext_bytes,
-            &aad,
-        )?;
+        let plaintext = upm_crypto::decrypt(&key, &[0u8; 12], &ciphertext_bytes, &aad)?;
         self.receiving_chain_key = Some(next_chain_key);
         self.recv_count += 1;
         Ok(plaintext)
@@ -397,7 +393,6 @@ impl crate::Session for DoubleRatchetSession {
         serde_json::to_vec(&wire).map_err(|_| WireError::Encoding.into())
     }
 
-
     /// Decryption is transactional: malformed or unauthenticated input must
     /// not advance or otherwise corrupt the ratchet state. Candidate state is
     /// cloned and committed only after successful AEAD authentication.
@@ -407,7 +402,6 @@ impl crate::Session for DoubleRatchetSession {
         *self = candidate;
         Ok(plaintext)
     }
-
 }
 
 // Small local base64 (mirrors upm-server's — kept dependency-free here too;
@@ -542,12 +536,17 @@ mod tests {
     #[test]
     fn typed_message_envelope_contains_sender_generated_id_and_peer() {
         let (mut alice, mut bob) = establish();
-        let envelope = alice.encrypt_envelope(DeviceId([0xA; 16]), 100, 200, b"typed envelope").unwrap();
+        let envelope = alice
+            .encrypt_envelope(DeviceId([0xA; 16]), 100, 200, b"typed envelope")
+            .unwrap();
         assert_eq!(envelope.protocol_version, ProtocolVersion::CURRENT);
         assert_eq!(envelope.sender_device_id, DeviceId([0xA; 16]));
         assert_eq!(envelope.recipient_device_id, DeviceId([0xB; 16]));
         assert_ne!(envelope.message_id, MessageId([0u8; 16]));
-        assert_eq!(bob.decrypt(&envelope.ciphertext).unwrap(), b"typed envelope");
+        assert_eq!(
+            bob.decrypt(&envelope.ciphertext).unwrap(),
+            b"typed envelope"
+        );
     }
 
     #[test]
@@ -585,7 +584,10 @@ mod tests {
         signed_message.extend_from_slice(&bob_exchange.public_key());
         signed_message.extend_from_slice(&bob_signed.public_key());
         let signed_sig = bob_signing.sign(&signed_message);
-        let opk_sig = bob_signing.sign(&crate::handshake::one_time_prekey_signature_message(bob_opk_id, &bob_opk.public_key()));
+        let opk_sig = bob_signing.sign(&crate::handshake::one_time_prekey_signature_message(
+            bob_opk_id,
+            &bob_opk.public_key(),
+        ));
 
         let bundle = PreKeyBundle {
             identity_signing_public: bob_signing.public_key(),
@@ -599,14 +601,20 @@ mod tests {
         let hs = crate::handshake::initiate(&alice_exchange, &bundle).unwrap();
         let alice_device = DeviceId([1; 16]);
         let bob_device = DeviceId([2; 16]);
-        let mut alice = DoubleRatchetSession::init_initiator(bob_device, &hs.result, hs.bob_initial_ratchet_public).unwrap();
+        let mut alice = DoubleRatchetSession::init_initiator(
+            bob_device,
+            &hs.result,
+            hs.bob_initial_ratchet_public,
+        )
+        .unwrap();
         let bob_hs = crate::handshake::respond(
             &bob_exchange,
             &bob_signed,
             &hs.my_identity_exchange_public,
             &hs.ephemeral_public,
             Some(&bob_opk),
-        ).unwrap();
+        )
+        .unwrap();
         let mut bob = DoubleRatchetSession::init_responder(alice_device, &bob_hs, bob_signed);
         let wire = alice.encrypt(b"hello with opk").unwrap();
         assert_eq!(bob.decrypt(&wire).unwrap(), b"hello with opk");
@@ -717,6 +725,185 @@ mod tests {
             } else {
                 let wire = bob.encrypt(msg.as_bytes()).unwrap();
                 assert_eq!(alice.decrypt(&wire).unwrap(), msg.as_bytes());
+            }
+        }
+    }
+
+    // -------------------------------------------------------------
+    // Randomized ("fuzz-lite") tests. Each runs many seeded, reproducible
+    // scenarios rather than one hand-picked example — a failure prints
+    // the seed, so it can be reproduced deterministically by re-running
+    // with that single seed. This is a lighter-weight alternative to a
+    // proper fuzzing harness (no external fuzzing crate/corpus), chosen
+    // to avoid pulling in dependencies whose MSRV might not match this
+    // project's older-toolchain constraint (see upm-crypto's pinning
+    // notes) — but it still meaningfully exercises interleavings and
+    // corruptions well beyond what the fixed examples above cover.
+    // -------------------------------------------------------------
+
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    /// Runs many random interleavings of "Alice sends", "Bob sends",
+    /// "deliver a random pending Alice→Bob message", and "deliver a
+    /// random pending Bob→Alice message" (out-of-order delivery is
+    /// explicitly allowed and expected). The core correctness invariant:
+    /// every legitimately delivered message must decrypt to *exactly*
+    /// the plaintext that was encrypted, no matter how sends and
+    /// deliveries get interleaved or reordered.
+    #[test]
+    fn randomized_bidirectional_conversation_preserves_plaintext() {
+        for seed in 0..300u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (mut alice, mut bob) = establish();
+
+            let mut alice_to_bob_pending: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut bob_to_alice_pending: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            // Per the Double Ratchet design (see init_responder's doc
+            // comment above), the responder has no sending chain until
+            // it has decrypted at least one message from the initiator —
+            // its own ratchet keypair only "activates" for sending after
+            // that first DH step. So Bob may not attempt to send until
+            // at least one Alice→Bob delivery has actually happened.
+            let mut bob_can_send = false;
+
+            let num_ops = rng.gen_range(10..60);
+            for i in 0..num_ops {
+                let choice = if bob_can_send {
+                    rng.gen_range(0..4)
+                } else {
+                    // Bob has nothing to send with yet — only offer "Alice
+                    // sends" or "deliver a pending Alice→Bob message".
+                    if rng.gen_bool(0.5) {
+                        0
+                    } else {
+                        2
+                    }
+                };
+                match choice {
+                    0 => {
+                        let text = format!("msg-a2b-{seed}-{i}").into_bytes();
+                        let wire = alice
+                            .encrypt(&text)
+                            .expect("seed {seed}: alice encrypt must succeed");
+                        alice_to_bob_pending.push((wire, text));
+                    }
+                    1 => {
+                        let text = format!("msg-b2a-{seed}-{i}").into_bytes();
+                        let wire = bob
+                            .encrypt(&text)
+                            .expect("seed {seed}: bob encrypt must succeed");
+                        bob_to_alice_pending.push((wire, text));
+                    }
+                    2 => {
+                        if !alice_to_bob_pending.is_empty() {
+                            let idx = rng.gen_range(0..alice_to_bob_pending.len());
+                            let (wire, expected) = alice_to_bob_pending.remove(idx);
+                            let decrypted = bob.decrypt(&wire).unwrap_or_else(|e| {
+                                panic!(
+                                    "seed {seed}: bob failed to decrypt a legitimate message: {e}"
+                                )
+                            });
+                            assert_eq!(
+                                decrypted, expected,
+                                "seed {seed}: bob decrypted the wrong plaintext"
+                            );
+                            bob_can_send = true;
+                        }
+                    }
+                    _ => {
+                        if !bob_to_alice_pending.is_empty() {
+                            let idx = rng.gen_range(0..bob_to_alice_pending.len());
+                            let (wire, expected) = bob_to_alice_pending.remove(idx);
+                            let decrypted = alice.decrypt(&wire).unwrap_or_else(|e| {
+                                panic!("seed {seed}: alice failed to decrypt a legitimate message: {e}")
+                            });
+                            assert_eq!(
+                                decrypted, expected,
+                                "seed {seed}: alice decrypted the wrong plaintext"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Flips a random bit in an otherwise-valid wire message and confirms
+    /// decryption never succeeds with the wrong plaintext. The main value
+    /// here isn't "tampering is rejected" (already covered by the
+    /// hand-picked `tampered_ciphertext_is_rejected` test above) — it's
+    /// exercising hundreds of different corruption positions to catch any
+    /// position-dependent panic in the JSON/base64 parsing path that a
+    /// single example wouldn't reach (a malformed-input panic would abort
+    /// this test with the offending seed, the same way a wrong assertion
+    /// would).
+    #[test]
+    fn randomized_bit_flip_never_produces_wrong_plaintext() {
+        for seed in 0..300u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (mut alice, mut bob) = establish();
+
+            let text = format!("secret-{seed}").into_bytes();
+            let mut wire = alice
+                .encrypt(&text)
+                .expect("seed {seed}: encrypt must succeed");
+
+            if !wire.is_empty() {
+                let byte_idx = rng.gen_range(0..wire.len());
+                let bit = 1u8 << rng.gen_range(0..8);
+                wire[byte_idx] ^= bit;
+            }
+
+            // A bit-flipped message must never decrypt to plaintext other
+            // than what was actually sent. In virtually every case it
+            // should fail outright (broken JSON, broken base64, or a
+            // rejected AEAD tag); the only acceptable "success" is exact
+            // agreement with the original plaintext.
+            if let Ok(decrypted) = bob.decrypt(&wire) {
+                assert_eq!(decrypted, text, "seed {seed}: bit-flipped message decrypted to the WRONG plaintext instead of failing");
+            }
+        }
+    }
+
+    /// Same idea as the bidirectional fuzzer above, but biased toward
+    /// longer out-of-order gaps between send and delivery, to exercise
+    /// `skip_receiving_keys`/the skipped-key map more heavily than the
+    /// smaller-scale interleaving test does.
+    #[test]
+    fn randomized_large_out_of_order_gaps_still_decrypt_correctly() {
+        for seed in 0..100u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (mut alice, mut bob) = establish();
+
+            // Send a batch of messages from Alice without Bob reading any
+            // of them yet, then deliver them all in a shuffled order —
+            // comfortably under MAX_SKIP so this tests legitimate
+            // reordering, not the skip-limit rejection path (that's
+            // covered elsewhere).
+            let batch_size = rng.gen_range(20..80);
+            let mut pending: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch_size);
+            for i in 0..batch_size {
+                let text = format!("batch-{seed}-{i}").into_bytes();
+                let wire = alice.encrypt(&text).expect("encrypt must succeed");
+                pending.push((wire, text));
+            }
+
+            // Fisher-Yates shuffle using the seeded RNG, so the delivery
+            // order is randomized but reproducible.
+            for i in (1..pending.len()).rev() {
+                let j = rng.gen_range(0..=i);
+                pending.swap(i, j);
+            }
+
+            for (wire, expected) in pending {
+                let decrypted = bob.decrypt(&wire).unwrap_or_else(|e| {
+                    panic!("seed {seed}: failed to decrypt a shuffled-order message: {e}")
+                });
+                assert_eq!(
+                    decrypted, expected,
+                    "seed {seed}: shuffled-order message decrypted incorrectly"
+                );
             }
         }
     }

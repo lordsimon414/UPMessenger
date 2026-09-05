@@ -47,14 +47,22 @@ fn client_key(request: &Request) -> String {
     let header = request
         .headers()
         .iter()
-        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("CF-Connecting-IP"))
+        .find(|h| {
+            h.field
+                .as_str()
+                .as_str()
+                .eq_ignore_ascii_case("CF-Connecting-IP")
+        })
         .map(|h| h.value.as_str().trim().to_string());
     if let Some(ip) = header {
         if !ip.is_empty() {
             return ip;
         }
     }
-    request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "unknown".to_string())
+    request
+        .remote_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Minimal, dependency-free access log: timestamp (Unix seconds), method,
@@ -73,7 +81,10 @@ fn client_key(request: &Request) -> String {
 /// closes that gap so those identifiers can't accumulate in the log
 /// either.
 fn log_line(method: &Method, path: &str, status: u16) {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let normalized = normalize_path_for_logging(path);
     println!("{now} {method:?} {normalized} {status}");
 }
@@ -88,7 +99,11 @@ fn log_line(method: &Method, path: &str, status: u16) {
 /// extra identifier, which is why this list is reviewed here explicitly
 /// rather than assumed to stay in sync automatically).
 fn normalize_path_for_logging(path: &str) -> String {
-    let segments: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    let segments: Vec<&str> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
     let normalized: Vec<&str> = match segments.as_slice() {
         ["v1", "directory", "resolve", _] => vec!["v1", "directory", "resolve", ":param"],
         ["v1", "directory", "resolve-id", _] => vec!["v1", "directory", "resolve-id", ":param"],
@@ -108,27 +123,55 @@ pub fn handle(state: &AppState, mut request: Request) {
     let bearer = extract_bearer(&request);
     let key = client_key(&request);
     let path = url.split('?').next().unwrap_or("");
-    let segments: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    let segments: Vec<&str> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
 
     if !state.ip_limiter.check(&key) {
         log_line(&method, path, 429);
-        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
-        let response = Response::from_string(error(429, "rate_limited", "too many requests, slow down").1)
-            .with_status_code(429).with_header(header);
+        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+            .expect("static header is valid");
+        let response =
+            Response::from_string(error(429, "rate_limited", "too many requests, slow down").1)
+                .with_status_code(429)
+                .with_header(header);
         let _ = request.respond(response);
         return;
     }
 
-    if segments.len() == 4 && segments[0] == "v1" && segments[1] == "attachments" && segments[3] == "blob" {
+    if segments.len() == 4
+        && segments[0] == "v1"
+        && segments[1] == "attachments"
+        && segments[3] == "blob"
+    {
         let auth_result = require_auth(state, bearer.as_deref());
         match auth_result {
             Ok(device_id) => {
-                let capability = request.headers().iter().find(|h| {
-                    h.field.as_str().as_str().eq_ignore_ascii_case("X-UPM-Attachment-Capability")
-                }).map(|h| h.value.as_str().trim().to_string());
+                let capability = request
+                    .headers()
+                    .iter()
+                    .find(|h| {
+                        h.field
+                            .as_str()
+                            .as_str()
+                            .eq_ignore_ascii_case("X-UPM-Attachment-Capability")
+                    })
+                    .map(|h| h.value.as_str().trim().to_string());
                 let result = match method {
-                    Method::Put => handle_attachment_upload(state, &segments[2].to_ascii_uppercase(), &device_id, &mut request),
-                    Method::Get => handle_attachment_download(state, &segments[2].to_ascii_uppercase(), &device_id, capability.as_deref()),
+                    Method::Put => handle_attachment_upload(
+                        state,
+                        &segments[2].to_ascii_uppercase(),
+                        &device_id,
+                        &mut request,
+                    ),
+                    Method::Get => handle_attachment_download(
+                        state,
+                        &segments[2].to_ascii_uppercase(),
+                        &device_id,
+                        capability.as_deref(),
+                    ),
                     _ => (405, Vec::new()),
                 };
                 log_line(&method, path, result.0);
@@ -137,8 +180,11 @@ pub fn handle(state: &AppState, mut request: Request) {
             }
             Err((status, body)) => {
                 log_line(&method, path, status);
-                let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
-                let response = Response::from_string(body).with_status_code(status).with_header(header);
+                let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .expect("static header is valid");
+                let response = Response::from_string(body)
+                    .with_status_code(status)
+                    .with_header(header);
                 let _ = request.respond(response);
             }
         }
@@ -147,19 +193,30 @@ pub fn handle(state: &AppState, mut request: Request) {
 
     const MAX_JSON_BODY_BYTES: u64 = 2 * 1024 * 1024;
     let mut raw_body = Vec::new();
-    if request.as_reader().take(MAX_JSON_BODY_BYTES + 1).read_to_end(&mut raw_body).is_err() {
+    if request
+        .as_reader()
+        .take(MAX_JSON_BODY_BYTES + 1)
+        .read_to_end(&mut raw_body)
+        .is_err()
+    {
         log_line(&method, path, 400);
-        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
-        let response = Response::from_string(error(400, "bad_request", "request body could not be read").1)
-            .with_status_code(400).with_header(header);
+        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+            .expect("static header is valid");
+        let response =
+            Response::from_string(error(400, "bad_request", "request body could not be read").1)
+                .with_status_code(400)
+                .with_header(header);
         let _ = request.respond(response);
         return;
     }
     if raw_body.len() as u64 > MAX_JSON_BODY_BYTES {
         log_line(&method, path, 413);
-        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
-        let response = Response::from_string(error(413, "request_too_large", "request body exceeds limit").1)
-            .with_status_code(413).with_header(header);
+        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+            .expect("static header is valid");
+        let response =
+            Response::from_string(error(413, "request_too_large", "request body exceeds limit").1)
+                .with_status_code(413)
+                .with_header(header);
         let _ = request.respond(response);
         return;
     }
@@ -167,9 +224,13 @@ pub fn handle(state: &AppState, mut request: Request) {
         Ok(body) => body,
         Err(_) => {
             log_line(&method, path, 400);
-            let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header is valid");
-            let response = Response::from_string(error(400, "bad_request", "request body must be UTF-8 JSON").1)
-                .with_status_code(400).with_header(header);
+            let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                .expect("static header is valid");
+            let response = Response::from_string(
+                error(400, "bad_request", "request body must be UTF-8 JSON").1,
+            )
+            .with_status_code(400)
+            .with_header(header);
             let _ = request.respond(response);
             return;
         }
@@ -226,30 +287,44 @@ fn route(
         .split('/')
         .filter(|s| !s.is_empty())
         .collect();
-    let seg: Vec<&str> = segments.iter().map(|s| *s).collect();
+    let seg: Vec<&str> = segments.to_vec();
 
     match (method, seg.as_slice()) {
         // Open endpoints.
         (Method::Post, ["v1", "account", "register"]) => {
             if !state.register_limiter.check(client_key) {
-                return error(429, "rate_limited", "too many registration attempts, try again later");
+                return error(
+                    429,
+                    "rate_limited",
+                    "too many registration attempts, try again later",
+                );
             }
             handle_register(state, body)
         }
         (Method::Get, ["v1", "directory", "resolve", username]) => handle_resolve(state, username),
-        (Method::Get, ["v1", "directory", "resolve-id", upm_id]) => handle_resolve_upm_id(state, upm_id),
+        (Method::Get, ["v1", "directory", "resolve-id", upm_id]) => {
+            handle_resolve_upm_id(state, upm_id)
+        }
         (Method::Get, ["v1", "profile", "public", username]) => {
             handle_public_profile(state, username)
         }
         (Method::Post, ["v1", "auth", "challenge"]) => {
             if !state.auth_limiter.check(&auth_rate_limit_key(body)) {
-                return error(429, "rate_limited", "too many auth attempts, try again later");
+                return error(
+                    429,
+                    "rate_limited",
+                    "too many auth attempts, try again later",
+                );
             }
             handle_auth_challenge(state, body)
         }
         (Method::Post, ["v1", "auth", "verify"]) => {
             if !state.auth_limiter.check(&auth_rate_limit_key(body)) {
-                return error(429, "rate_limited", "too many auth attempts, try again later");
+                return error(
+                    429,
+                    "rate_limited",
+                    "too many auth attempts, try again later",
+                );
             }
             handle_auth_verify(state, body)
         }
@@ -261,21 +336,31 @@ fn route(
             Ok(device) => handle_profile_privacy(state, body, &device),
             Err(e) => e,
         },
+        (Method::Get, ["v1", "profile", "privacy"]) => match require_auth(state, bearer) {
+            Ok(device) => handle_get_profile_privacy(state, &device),
+            Err(e) => e,
+        },
 
         // Authenticated endpoints.
-        (Method::Get, ["v1", "devices", "keys", device_id]) => handle_get_device_keys(state, device_id),
+        (Method::Get, ["v1", "devices", "keys", device_id]) => {
+            handle_get_device_keys(state, device_id)
+        }
         (Method::Post, ["v1", "devices", "keys"]) => match require_auth(state, bearer) {
             Ok(authenticated_device) => handle_publish_keys(state, body, &authenticated_device),
             Err(e) => e,
         },
         (Method::Post, ["v1", "devices", "prekeys"]) => match require_auth(state, bearer) {
-            Ok(authenticated_device) => handle_publish_one_time_prekeys(state, body, &authenticated_device),
+            Ok(authenticated_device) => {
+                handle_publish_one_time_prekeys(state, body, &authenticated_device)
+            }
             Err(e) => e,
         },
-        (Method::Post, ["v1", "devices", "prekeys", "claim"]) => match require_auth(state, bearer) {
-            Ok(_authenticated_device) => handle_claim_one_time_prekey(state, body),
-            Err(e) => e,
-        },
+        (Method::Post, ["v1", "devices", "prekeys", "claim"]) => {
+            match require_auth(state, bearer) {
+                Ok(_authenticated_device) => handle_claim_one_time_prekey(state, body),
+                Err(e) => e,
+            }
+        }
         (Method::Post, ["v1", "messages", "send"]) => match require_auth(state, bearer) {
             Ok(sender_device) => handle_send(state, body, &sender_device),
             Err(e) => e,
@@ -289,7 +374,9 @@ fn route(
             Err(e) => e,
         },
         (Method::Post, ["v1", "attachments", "create"]) => match require_auth(state, bearer) {
-            Ok(authenticated_device) => handle_attachment_create(state, body, &authenticated_device),
+            Ok(authenticated_device) => {
+                handle_attachment_create(state, body, &authenticated_device)
+            }
             Err(e) => e,
         },
         (Method::Delete, ["v1", "attachments", id]) => match require_auth(state, bearer) {
@@ -308,7 +395,11 @@ fn route(
 fn auth_rate_limit_key(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| v.get("device_id").and_then(|d| d.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("device_id")
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string())
+        })
         .unwrap_or_else(|| "malformed".to_string())
 }
 
@@ -415,7 +506,6 @@ fn handle_resolve_upm_id(state: &AppState, upm_id: &str) -> (u16, String) {
     }
 }
 
-
 // ---------------------------------------------------------------------
 // POST /v1/auth/challenge, POST /v1/auth/verify
 // ---------------------------------------------------------------------
@@ -484,9 +574,15 @@ fn handle_logout(state: &AppState, token: &str) -> (u16, String) {
 }
 
 #[derive(Deserialize)]
-struct PrivacyRequest { directory_visible: bool }
+struct PrivacyRequest {
+    directory_visible: bool,
+}
 
-fn handle_profile_privacy(state: &AppState, body: &str, authenticated_device: &str) -> (u16, String) {
+fn handle_profile_privacy(
+    state: &AppState,
+    body: &str,
+    authenticated_device: &str,
+) -> (u16, String) {
     let req: PrivacyRequest = match serde_json::from_str(body) {
         Ok(r) => r,
         Err(_) => return error(400, "bad_request", "invalid privacy payload"),
@@ -494,8 +590,25 @@ fn handle_profile_privacy(state: &AppState, body: &str, authenticated_device: &s
     let conn = state.db.lock().expect("db mutex poisoned");
     match db::set_directory_visibility(&conn, authenticated_device, req.directory_visible) {
         Ok(()) => ok(200, json!({ "directory_visible": req.directory_visible })),
-        Err(DbError::DeviceNotFound) => error(404, "device_not_found", "authenticated device not found"),
+        Err(DbError::DeviceNotFound) => {
+            error(404, "device_not_found", "authenticated device not found")
+        }
         Err(_) => error(500, "internal_error", "privacy setting update failed"),
+    }
+}
+
+/// Reads back the authenticated account's current directory-visibility
+/// setting. Lets a client correctly initialize its "discoverable" UI
+/// state on login instead of assuming a default that may not match what
+/// was actually set in an earlier session.
+fn handle_get_profile_privacy(state: &AppState, authenticated_device: &str) -> (u16, String) {
+    let conn = state.db.lock().expect("db mutex poisoned");
+    match db::get_directory_visibility(&conn, authenticated_device) {
+        Ok(directory_visible) => ok(200, json!({ "directory_visible": directory_visible })),
+        Err(DbError::DeviceNotFound) => {
+            error(404, "device_not_found", "authenticated device not found")
+        }
+        Err(_) => error(500, "internal_error", "privacy setting lookup failed"),
     }
 }
 
@@ -518,7 +631,6 @@ fn valid_signature(candidate: &str) -> bool {
     decode_fixed::<64>(candidate).is_some()
 }
 
-
 fn handle_publish_keys(state: &AppState, body: &str, authenticated_device: &str) -> (u16, String) {
     let req: PublishKeysRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -528,37 +640,72 @@ fn handle_publish_keys(state: &AppState, body: &str, authenticated_device: &str)
         || !valid_fixed_key(&req.signed_prekey_public)
         || !valid_signature(&req.signed_prekey_signature)
     {
-        return error(400, "invalid_key_bundle", "invalid X3DH device key material");
+        return error(
+            400,
+            "invalid_key_bundle",
+            "invalid X3DH device key material",
+        );
     }
 
     let conn = state.db.lock().expect("db mutex poisoned");
-    let identity_public_key = match db::get_device_identity_public_key(&conn, authenticated_device) {
+    let identity_public_key = match db::get_device_identity_public_key(&conn, authenticated_device)
+    {
         Ok(key) => key,
-        Err(DbError::DeviceNotFound) => return error(404, "device_not_found", "unknown authenticated device"),
+        Err(DbError::DeviceNotFound) => {
+            return error(404, "device_not_found", "unknown authenticated device")
+        }
         Err(_) => return error(500, "internal_error", "key publication failed"),
     };
     let identity_public_key: [u8; 32] = match decode_fixed(&identity_public_key) {
         Some(key) => key,
-        None => return error(500, "internal_error", "stored device identity key is invalid"),
+        None => {
+            return error(
+                500,
+                "internal_error",
+                "stored device identity key is invalid",
+            )
+        }
     };
     let identity_exchange_public: [u8; 32] = match decode_fixed(&req.identity_exchange_public) {
         Some(key) => key,
-        None => return error(400, "invalid_key_bundle", "invalid X3DH device key material"),
+        None => {
+            return error(
+                400,
+                "invalid_key_bundle",
+                "invalid X3DH device key material",
+            )
+        }
     };
     let signed_prekey_public: [u8; 32] = match decode_fixed(&req.signed_prekey_public) {
         Some(key) => key,
-        None => return error(400, "invalid_key_bundle", "invalid X3DH device key material"),
+        None => {
+            return error(
+                400,
+                "invalid_key_bundle",
+                "invalid X3DH device key material",
+            )
+        }
     };
     let signature: [u8; 64] = match decode_fixed(&req.signed_prekey_signature) {
         Some(sig) => sig,
-        None => return error(400, "invalid_key_bundle", "invalid X3DH device key material"),
+        None => {
+            return error(
+                400,
+                "invalid_key_bundle",
+                "invalid X3DH device key material",
+            )
+        }
     };
     let mut signed_message = Vec::with_capacity(21 + 32 + 32);
     signed_message.extend_from_slice(b"UPM/v4/signed-prekey/");
     signed_message.extend_from_slice(&identity_exchange_public);
     signed_message.extend_from_slice(&signed_prekey_public);
     if upm_crypto::verify(&identity_public_key, &signed_message, &signature).is_err() {
-        return error(400, "invalid_key_bundle", "X3DH prekey signature does not match device identity");
+        return error(
+            400,
+            "invalid_key_bundle",
+            "X3DH prekey signature does not match device identity",
+        );
     }
 
     match db::update_device_keys(
@@ -569,7 +716,9 @@ fn handle_publish_keys(state: &AppState, body: &str, authenticated_device: &str)
         &req.signed_prekey_signature,
     ) {
         Ok(()) => ok(200, json!({ "device_id": authenticated_device })),
-        Err(DbError::DeviceNotFound) => error(404, "device_not_found", "unknown authenticated device"),
+        Err(DbError::DeviceNotFound) => {
+            error(404, "device_not_found", "unknown authenticated device")
+        }
         Err(_) => error(500, "internal_error", "key publication failed"),
     }
 }
@@ -586,23 +735,40 @@ struct PublishOneTimePreKeyItem {
     signature: String,
 }
 
-fn handle_publish_one_time_prekeys(state: &AppState, body: &str, authenticated_device: &str) -> (u16, String) {
+fn handle_publish_one_time_prekeys(
+    state: &AppState,
+    body: &str,
+    authenticated_device: &str,
+) -> (u16, String) {
     let req: PublishOneTimePreKeysRequest = match serde_json::from_str(body) {
         Ok(r) => r,
         Err(_) => return error(400, "bad_request", "invalid one-time prekey payload"),
     };
     if req.prekeys.is_empty() || req.prekeys.len() > 128 {
-        return error(400, "invalid_prekeys", "one-time prekey batch size is invalid");
+        return error(
+            400,
+            "invalid_prekeys",
+            "one-time prekey batch size is invalid",
+        );
     }
     let conn = state.db.lock().expect("db mutex poisoned");
-    let identity_public_key = match db::get_device_identity_public_key(&conn, authenticated_device) {
+    let identity_public_key = match db::get_device_identity_public_key(&conn, authenticated_device)
+    {
         Ok(key) => key,
-        Err(DbError::DeviceNotFound) => return error(404, "device_not_found", "unknown authenticated device"),
+        Err(DbError::DeviceNotFound) => {
+            return error(404, "device_not_found", "unknown authenticated device")
+        }
         Err(_) => return error(500, "internal_error", "one-time prekey publication failed"),
     };
     let identity_public_key: [u8; 32] = match decode_fixed(&identity_public_key) {
         Some(key) => key,
-        None => return error(500, "internal_error", "stored device identity key is invalid"),
+        None => {
+            return error(
+                500,
+                "internal_error",
+                "stored device identity key is invalid",
+            )
+        }
     };
     let mut entries = Vec::with_capacity(req.prekeys.len());
     for item in &req.prekeys {
@@ -620,36 +786,57 @@ fn handle_publish_one_time_prekeys(state: &AppState, body: &str, authenticated_d
         };
         let message = upm_core::handshake::one_time_prekey_signature_message(id, &public_key);
         if upm_crypto::verify(&identity_public_key, &message, &signature).is_err() {
-            return error(400, "invalid_prekey", "one-time prekey signature does not match device identity");
+            return error(
+                400,
+                "invalid_prekey",
+                "one-time prekey signature does not match device identity",
+            );
         }
-        entries.push((item.prekey_id.clone(), item.public_key.clone(), item.signature.clone()));
+        entries.push((
+            item.prekey_id.clone(),
+            item.public_key.clone(),
+            item.signature.clone(),
+        ));
     }
     match db::publish_one_time_prekeys(&conn, authenticated_device, &entries) {
         Ok(published) => ok(200, json!({ "published": published })),
-        Err(DbError::DeviceNotFound) => error(404, "device_not_found", "unknown authenticated device"),
+        Err(DbError::DeviceNotFound) => {
+            error(404, "device_not_found", "unknown authenticated device")
+        }
         Err(_) => error(500, "internal_error", "one-time prekey publication failed"),
     }
 }
 
 fn handle_claim_one_time_prekey(state: &AppState, body: &str) -> (u16, String) {
     #[derive(Deserialize)]
-    struct ClaimRequest { device_id: String }
+    struct ClaimRequest {
+        device_id: String,
+    }
     let req: ClaimRequest = match serde_json::from_str(body) {
         Ok(r) => r,
         Err(_) => return error(400, "bad_request", "invalid one-time prekey claim payload"),
     };
     let device_id = match DeviceId::from_hex(&req.device_id) {
         Some(id) => id.to_hex(),
-        None => return error(400, "invalid_device_id", "device_id must be 16 bytes encoded as 32 hex characters"),
+        None => {
+            return error(
+                400,
+                "invalid_device_id",
+                "device_id must be 16 bytes encoded as 32 hex characters",
+            )
+        }
     };
     let conn = state.db.lock().expect("db mutex poisoned");
     match db::claim_one_time_prekey(&conn, &device_id) {
-        Ok(Some(record)) => ok(200, json!({
-            "available": true,
-            "prekey_id": record.prekey_id,
-            "public_key": record.public_key,
-            "signature": record.signature,
-        })),
+        Ok(Some(record)) => ok(
+            200,
+            json!({
+                "available": true,
+                "prekey_id": record.prekey_id,
+                "public_key": record.public_key,
+                "signature": record.signature,
+            }),
+        ),
         Ok(None) => ok(200, json!({ "available": false })),
         Err(DbError::DeviceNotFound) => error(404, "device_not_found", "unknown target device"),
         Err(_) => error(500, "internal_error", "one-time prekey claim failed"),
@@ -663,7 +850,13 @@ fn handle_claim_one_time_prekey(state: &AppState, body: &str) -> (u16, String) {
 fn handle_get_device_keys(state: &AppState, device_id: &str) -> (u16, String) {
     let parsed = match DeviceId::from_hex(device_id) {
         Some(id) => id,
-        None => return error(400, "invalid_device_id", "device_id must be 16 bytes encoded as 32 hex characters"),
+        None => {
+            return error(
+                400,
+                "invalid_device_id",
+                "device_id must be 16 bytes encoded as 32 hex characters",
+            )
+        }
     };
     let conn = state.db.lock().expect("db mutex poisoned");
     let bundle = match db::get_device_prekey_bundle(&conn, &parsed.to_hex()) {
@@ -675,15 +868,22 @@ fn handle_get_device_keys(state: &AppState, device_id: &str) -> (u16, String) {
         || bundle.signed_prekey_public.is_empty()
         || bundle.signed_prekey_signature.is_empty()
     {
-        return error(409, "keys_unavailable", "device has not published a complete X3DH key bundle");
+        return error(
+            409,
+            "keys_unavailable",
+            "device has not published a complete X3DH key bundle",
+        );
     }
-    ok(200, json!({
-        "device_id": bundle.device_id,
-        "identity_public_key": bundle.identity_public_key,
-        "identity_exchange_public": bundle.identity_exchange_public,
-        "signed_prekey_public": bundle.signed_prekey_public,
-        "signed_prekey_signature": bundle.signed_prekey_signature,
-    }))
+    ok(
+        200,
+        json!({
+            "device_id": bundle.device_id,
+            "identity_public_key": bundle.identity_public_key,
+            "identity_exchange_public": bundle.identity_exchange_public,
+            "signed_prekey_public": bundle.signed_prekey_public,
+            "signed_prekey_signature": bundle.signed_prekey_signature,
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -702,8 +902,6 @@ struct SendRequest {
     ttl_seconds: Option<i64>,
 }
 
-
-
 fn handle_send(state: &AppState, body: &str, authenticated_sender: &str) -> (u16, String) {
     let req: SendRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -715,11 +913,23 @@ fn handle_send(state: &AppState, body: &str, authenticated_sender: &str) -> (u16
     }
     let message_id = match MessageId::from_hex(&req.message_id) {
         Some(id) => id,
-        None => return error(400, "invalid_message_id", "message_id must be 16 random bytes encoded as 32 hex characters"),
+        None => {
+            return error(
+                400,
+                "invalid_message_id",
+                "message_id must be 16 random bytes encoded as 32 hex characters",
+            )
+        }
     };
     let recipient_device_id = match DeviceId::from_hex(&req.recipient_device_id) {
         Some(id) => id,
-        None => return error(400, "invalid_device_id", "recipient_device_id must be 16 random bytes encoded as 32 hex characters"),
+        None => {
+            return error(
+                400,
+                "invalid_device_id",
+                "recipient_device_id must be 16 random bytes encoded as 32 hex characters",
+            )
+        }
     };
 
     let ciphertext = match base64_decode(&req.ciphertext_base64) {
@@ -736,11 +946,21 @@ fn handle_send(state: &AppState, body: &str, authenticated_sender: &str) -> (u16
     let server_timestamp = current_unix_seconds();
     let ttl = req.ttl_seconds.unwrap_or(db::DEFAULT_MESSAGE_TTL_SECONDS);
     if ttl <= 0 || ttl > db::DEFAULT_MESSAGE_TTL_SECONDS {
-        return error(400, "invalid_ttl", "ttl_seconds is outside the allowed retention window");
+        return error(
+            400,
+            "invalid_ttl",
+            "ttl_seconds is outside the allowed retention window",
+        );
     }
     let sender_device_id = match DeviceId::from_hex(authenticated_sender) {
         Some(id) => id,
-        None => return error(500, "internal_error", "authenticated device identity is invalid"),
+        None => {
+            return error(
+                500,
+                "internal_error",
+                "authenticated device identity is invalid",
+            )
+        }
     };
     let envelope = MessageEnvelope {
         protocol_version: ProtocolVersion(req.protocol_version),
@@ -850,7 +1070,11 @@ struct CreateAttachmentRequest {
 /// attachment limit: 100 MB; configurable server-side").
 const MAX_ATTACHMENT_BYTES: i64 = 100 * 1024 * 1024;
 
-fn handle_attachment_create(state: &AppState, body: &str, authenticated_device: &str) -> (u16, String) {
+fn handle_attachment_create(
+    state: &AppState,
+    body: &str,
+    authenticated_device: &str,
+) -> (u16, String) {
     let req: CreateAttachmentRequest = match serde_json::from_str(body) {
         Ok(r) => r,
         Err(_) => return error(400, "bad_request", "invalid attachment payload"),
@@ -880,7 +1104,11 @@ fn handle_attachment_create(state: &AppState, body: &str, authenticated_device: 
     }
 }
 
-fn handle_attachment_delete(state: &AppState, attachment_id: &str, authenticated_device: &str) -> (u16, String) {
+fn handle_attachment_delete(
+    state: &AppState,
+    attachment_id: &str,
+    authenticated_device: &str,
+) -> (u16, String) {
     let record = {
         let conn = state.db.lock().expect("db mutex poisoned");
         match db::get_attachment(&conn, attachment_id) {
@@ -890,12 +1118,17 @@ fn handle_attachment_delete(state: &AppState, attachment_id: &str, authenticated
         }
     };
     if record.owner_device_id != authenticated_device {
-        return error(403, "forbidden", "attachment does not belong to authenticated device");
+        return error(
+            403,
+            "forbidden",
+            "attachment does not belong to authenticated device",
+        );
     }
     let conn = state.db.lock().expect("db mutex poisoned");
     match db::delete_attachment(&conn, authenticated_device, attachment_id) {
         Ok(true) => {
-            let _ = std::fs::remove_file(attachment_path(&state.attachment_dir, &record.storage_key));
+            let _ =
+                std::fs::remove_file(attachment_path(&state.attachment_dir, &record.storage_key));
             ok(200, json!({ "deleted": true }))
         }
         Ok(false) => error(404, "not_found", "no such attachment"),
@@ -932,18 +1165,28 @@ fn handle_attachment_upload(
     }
     let max = record.opaque_size as u64;
     let mut bytes = Vec::new();
-    if request.as_reader().take(max.saturating_add(1)).read_to_end(&mut bytes).is_err() {
+    if request
+        .as_reader()
+        .take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
         return (400, b"attachment upload could not be read".to_vec());
     }
     if bytes.len() as u64 != max {
-        return (400, b"attachment size does not match reserved size".to_vec());
+        return (
+            400,
+            b"attachment size does not match reserved size".to_vec(),
+        );
     }
     if std::fs::create_dir_all(&state.attachment_dir).is_err() {
         return (500, b"attachment storage unavailable".to_vec());
     }
     let final_path = attachment_path(&state.attachment_dir, &record.storage_key);
     let tmp_path = final_path.with_extension("blob.part");
-    if std::fs::write(&tmp_path, &bytes).is_err() || std::fs::rename(&tmp_path, &final_path).is_err() {
+    if std::fs::write(&tmp_path, &bytes).is_err()
+        || std::fs::rename(&tmp_path, &final_path).is_err()
+    {
         let _ = std::fs::remove_file(&tmp_path);
         return (500, b"attachment storage failed".to_vec());
     }
@@ -961,7 +1204,12 @@ fn handle_attachment_upload(
     }
 }
 
-fn handle_attachment_download(state: &AppState, attachment_id: &str, _authenticated_device: &str, capability: Option<&str>) -> (u16, Vec<u8>) {
+fn handle_attachment_download(
+    state: &AppState,
+    attachment_id: &str,
+    _authenticated_device: &str,
+    capability: Option<&str>,
+) -> (u16, Vec<u8>) {
     if DeviceId::from_hex(attachment_id).is_none() {
         return (400, b"invalid attachment id".to_vec());
     }
@@ -1028,12 +1276,30 @@ mod tests {
     fn logging_normalizes_identifiers_embedded_in_the_path() {
         // These all embed a sensitive identifier directly in the URL path
         // (not a query string) — the access log must not leak it.
-        assert_eq!(normalize_path_for_logging("/v1/directory/resolve/alice"), "/v1/directory/resolve/:param");
-        assert_eq!(normalize_path_for_logging("/v1/directory/resolve-id/KML3-9V8E-PE4G"), "/v1/directory/resolve-id/:param");
-        assert_eq!(normalize_path_for_logging("/v1/profile/public/alice"), "/v1/profile/public/:param");
-        assert_eq!(normalize_path_for_logging("/v1/devices/keys/AABBCCDD"), "/v1/devices/keys/:param");
-        assert_eq!(normalize_path_for_logging("/v1/attachments/AABBCCDD"), "/v1/attachments/:param");
-        assert_eq!(normalize_path_for_logging("/v1/attachments/AABBCCDD/blob"), "/v1/attachments/:param/blob");
+        assert_eq!(
+            normalize_path_for_logging("/v1/directory/resolve/alice"),
+            "/v1/directory/resolve/:param"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/directory/resolve-id/KML3-9V8E-PE4G"),
+            "/v1/directory/resolve-id/:param"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/profile/public/alice"),
+            "/v1/profile/public/:param"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/devices/keys/AABBCCDD"),
+            "/v1/devices/keys/:param"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/attachments/AABBCCDD"),
+            "/v1/attachments/:param"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/attachments/AABBCCDD/blob"),
+            "/v1/attachments/:param/blob"
+        );
     }
 
     #[test]
@@ -1041,18 +1307,54 @@ mod tests {
         // None of these have a parameter to redact — a real bug in the
         // normalizer would either leave an identifier route un-redacted
         // above, or (this test's job) over-redact a route that has none.
-        assert_eq!(normalize_path_for_logging("/v1/account/register"), "/v1/account/register");
-        assert_eq!(normalize_path_for_logging("/v1/auth/challenge"), "/v1/auth/challenge");
-        assert_eq!(normalize_path_for_logging("/v1/auth/verify"), "/v1/auth/verify");
-        assert_eq!(normalize_path_for_logging("/v1/auth/session"), "/v1/auth/session");
-        assert_eq!(normalize_path_for_logging("/v1/profile/privacy"), "/v1/profile/privacy");
-        assert_eq!(normalize_path_for_logging("/v1/devices/keys"), "/v1/devices/keys");
-        assert_eq!(normalize_path_for_logging("/v1/devices/prekeys"), "/v1/devices/prekeys");
-        assert_eq!(normalize_path_for_logging("/v1/devices/prekeys/claim"), "/v1/devices/prekeys/claim");
-        assert_eq!(normalize_path_for_logging("/v1/messages/send"), "/v1/messages/send");
-        assert_eq!(normalize_path_for_logging("/v1/messages/pull"), "/v1/messages/pull");
-        assert_eq!(normalize_path_for_logging("/v1/messages/ack"), "/v1/messages/ack");
-        assert_eq!(normalize_path_for_logging("/v1/attachments/create"), "/v1/attachments/create");
+        assert_eq!(
+            normalize_path_for_logging("/v1/account/register"),
+            "/v1/account/register"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/auth/challenge"),
+            "/v1/auth/challenge"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/auth/verify"),
+            "/v1/auth/verify"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/auth/session"),
+            "/v1/auth/session"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/profile/privacy"),
+            "/v1/profile/privacy"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/devices/keys"),
+            "/v1/devices/keys"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/devices/prekeys"),
+            "/v1/devices/prekeys"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/devices/prekeys/claim"),
+            "/v1/devices/prekeys/claim"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/messages/send"),
+            "/v1/messages/send"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/messages/pull"),
+            "/v1/messages/pull"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/messages/ack"),
+            "/v1/messages/ack"
+        );
+        assert_eq!(
+            normalize_path_for_logging("/v1/attachments/create"),
+            "/v1/attachments/create"
+        );
     }
 
     #[test]

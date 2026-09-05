@@ -77,13 +77,19 @@ enum Direction {
 fn load_or_generate_identity() -> LocalIdentity {
     if let Some(secrets) = storage::load_secrets() {
         let decode = |value: &str| -> Option<[u8; 32]> {
-            let bytes = base64::engine::general_purpose::STANDARD.decode(value).ok()?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .ok()?;
             bytes.try_into().ok()
         };
-        let opks = secrets.one_time_prekeys.iter().filter_map(|item| {
-            let key = decode(&item.private_b64)?;
-            Some((item.id, key))
-        }).collect::<Vec<_>>();
+        let opks = secrets
+            .one_time_prekeys
+            .iter()
+            .filter_map(|item| {
+                let key = decode(&item.private_b64)?;
+                Some((item.id, key))
+            })
+            .collect::<Vec<_>>();
         if let (Some(a), Some(b), Some(c)) = (
             decode(&secrets.signing_private_b64),
             decode(&secrets.exchange_private_b64),
@@ -103,7 +109,8 @@ fn load_or_generate_identity() -> LocalIdentity {
 
 fn persist_identity_secrets(identity: &LocalIdentity) {
     let (a, b, c) = identity.private_key_bytes();
-    let secrets = storage::local_secrets_from_bytes(a, b, c, identity.one_time_prekey_private_keys());
+    let secrets =
+        storage::local_secrets_from_bytes(a, b, c, identity.one_time_prekey_private_keys());
     let _ = storage::save_secrets(&secrets);
 }
 
@@ -111,14 +118,18 @@ fn decode_32(value: &str) -> Result<[u8; 32], ClientCryptoError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(value)
         .map_err(|_| ClientCryptoError::InvalidBase64)?;
-    bytes.try_into().map_err(|_| ClientCryptoError::InvalidKeyLength)
+    bytes
+        .try_into()
+        .map_err(|_| ClientCryptoError::InvalidKeyLength)
 }
 
 fn decode_64(value: &str) -> Result<[u8; 64], ClientCryptoError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(value)
         .map_err(|_| ClientCryptoError::InvalidBase64)?;
-    bytes.try_into().map_err(|_| ClientCryptoError::InvalidKeyLength)
+    bytes
+        .try_into()
+        .map_err(|_| ClientCryptoError::InvalidKeyLength)
 }
 
 fn decode_device_id(value: &str) -> Result<DeviceId, ClientCryptoError> {
@@ -198,7 +209,11 @@ fn fingerprint_hex(identity_public_key: &[u8; 32]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(identity_public_key);
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    hex.as_bytes().chunks(8).map(|c| String::from_utf8_lossy(c).to_string()).collect::<Vec<_>>().join(" ")
+    hex.as_bytes()
+        .chunks(8)
+        .map(|c| String::from_utf8_lossy(c).to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A "safety number"-style combined fingerprint over two identity keys.
@@ -218,7 +233,11 @@ fn safety_number(a: &[u8; 32], b: &[u8; 32]) -> String {
     hasher.update(second);
     let digest = hasher.finalize();
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    hex.as_bytes().chunks(8).map(|c| String::from_utf8_lossy(c).to_string()).collect::<Vec<_>>().join(" ")
+    hex.as_bytes()
+        .chunks(8)
+        .map(|c| String::from_utf8_lossy(c).to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub struct UpmApp {
@@ -233,6 +252,12 @@ pub struct UpmApp {
     local_store: Option<LocalStore>,
     last_poll: f64,
     directory_visible: bool,
+    /// Tracks whether the background poll is currently failing, so a
+    /// connectivity problem is announced once (and once more when it
+    /// clears) instead of overwriting the status line with the same
+    /// "Pull failed" message every ~2 seconds and burying whatever the
+    /// user actually did last (send a message, resolve a contact, ...).
+    poll_is_failing: bool,
 }
 
 impl UpmApp {
@@ -256,6 +281,7 @@ impl UpmApp {
             local_store,
             last_poll: 0.0,
             directory_visible: true,
+            poll_is_failing: false,
         };
         // Auto-login: a returning user already has a device_id from a
         // previous run, so log them straight back in instead of leaving
@@ -297,19 +323,23 @@ impl UpmApp {
                 self.status = format!("Registered as {}", r.upm_id);
                 self.authenticate();
             }
-            Err(e) => self.status = format!("Registration failed: {e}"),
+            Err(e) => self.status = crate::api::friendly_message(&e),
         }
     }
 
     fn publish_prekeys(&mut self, api: &ApiClient, token: &str) -> Result<(), String> {
-        let batch = self.identity.publishable_one_time_prekeys()
+        let batch = self
+            .identity
+            .publishable_one_time_prekeys()
             .into_iter()
             .map(|(id, public, signature)| (id.to_hex(), public, signature))
             .collect::<Vec<_>>();
-        if batch.is_empty() { return Ok(()); }
+        if batch.is_empty() {
+            return Ok(());
+        }
         api.publish_one_time_prekeys(token, &batch)
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| crate::api::friendly_message(&e))
     }
 
     fn authenticate(&mut self) {
@@ -320,7 +350,10 @@ impl UpmApp {
         let Some(api) = self.api.clone() else { return };
         let challenge = match api.challenge(&device_id) {
             Ok((c, _)) => c,
-            Err(e) => { self.status = format!("Challenge failed: {e}"); return; }
+            Err(e) => {
+                self.status = format!("Challenge failed: {}", crate::api::friendly_message(&e));
+                return;
+            }
         };
         let signature = self.identity.signing.sign(&challenge);
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
@@ -330,27 +363,74 @@ impl UpmApp {
                 self.profile.session_expires_at = Some(v.expires_at);
                 self.save();
                 let token = self.profile.session_token.clone().unwrap_or_default();
-                if let Err(e) = api.publish_keys(&token, &self.identity.exchange_public_b64(), &self.identity.signed_prekey_public_b64(), &self.identity.signed_prekey_signature_b64()) {
-                    self.status = format!("Authenticated, key publish failed: {e}");
+                // Best-effort: sync the "Discoverable" checkbox with
+                // whatever was actually set server-side in an earlier
+                // session, instead of leaving it at its default. Not
+                // worth failing the whole login over if this one lookup
+                // fails — it just means the checkbox keeps showing its
+                // previous local value until the next successful sync.
+                if let Ok(visible) = api.get_directory_visibility(&token) {
+                    self.directory_visible = visible;
+                }
+                if let Err(e) = api.publish_keys(
+                    &token,
+                    &self.identity.exchange_public_b64(),
+                    &self.identity.signed_prekey_public_b64(),
+                    &self.identity.signed_prekey_signature_b64(),
+                ) {
+                    self.status = format!(
+                        "Authenticated, key publish failed: {}",
+                        crate::api::friendly_message(&e)
+                    );
                     return;
                 }
                 self.identity.ensure_one_time_prekey_pool(12);
                 persist_identity_secrets(&self.identity);
                 match self.publish_prekeys(&api, &token) {
-                    Ok(()) => self.status = format!("Authenticated + X3DH bundle published ({} OPKs)", self.identity.one_time_prekeys.len()),
-                    Err(e) => self.status = format!("Authenticated + signed prekey published; OPK publish failed: {e}"),
+                    Ok(()) => {
+                        self.status = format!(
+                            "Authenticated + X3DH bundle published ({} OPKs)",
+                            self.identity.one_time_prekeys.len()
+                        )
+                    }
+                    Err(e) => {
+                        self.status = format!(
+                            "Authenticated + signed prekey published; OPK publish failed: {e}"
+                        )
+                    }
                 }
             }
-            Err(e) => self.status = format!("Authentication failed: {e}"),
+            Err(e) => {
+                self.status = format!(
+                    "Authentication failed: {}",
+                    crate::api::friendly_message(&e)
+                )
+            }
         }
     }
 
     fn update_directory_visibility(&mut self) {
-        let Some(token) = self.profile.session_token.clone() else { return; };
-        let Some(api) = self.api.clone() else { return; };
+        let Some(token) = self.profile.session_token.clone() else {
+            return;
+        };
+        let Some(api) = self.api.clone() else {
+            return;
+        };
         match api.set_directory_visibility(&token, self.directory_visible) {
-            Ok(()) => self.status = if self.directory_visible { "Directory visibility enabled" } else { "Directory visibility disabled" }.into(),
-            Err(e) => self.status = format!("Privacy setting failed: {e}"),
+            Ok(()) => {
+                self.status = if self.directory_visible {
+                    "Directory visibility enabled"
+                } else {
+                    "Directory visibility disabled"
+                }
+                .into()
+            }
+            Err(e) => {
+                self.status = format!(
+                    "Privacy setting failed: {}",
+                    crate::api::friendly_message(&e)
+                )
+            }
         }
     }
 
@@ -362,7 +442,12 @@ impl UpmApp {
         if let (Some(token), Some(api)) = (&token, self.api.clone()) {
             match api.logout(token) {
                 Ok(()) => self.status = "Logged out".into(),
-                Err(e) => self.status = format!("Logged out locally (server logout failed: {e})"),
+                Err(e) => {
+                    self.status = format!(
+                        "Logged out locally (server logout failed: {})",
+                        crate::api::friendly_message(&e)
+                    )
+                }
             }
         } else {
             self.status = "Logged out".into();
@@ -381,14 +466,27 @@ impl UpmApp {
     fn resolve(&mut self) {
         let Some(api) = self.api.clone() else { return };
         let query = self.new_contact.trim();
-        let result = if query.starts_with('@') { api.resolve_username(query.trim_start_matches('@')) } else if upm_protocol::PreKeyId::from_hex(query).is_some() || query.len() >= 8 { api.resolve_upm_id(query) } else { api.resolve_username(query) };
+        let result = if query.starts_with('@') {
+            api.resolve_username(query.trim_start_matches('@'))
+        } else if upm_protocol::PreKeyId::from_hex(query).is_some() || query.len() >= 8 {
+            api.resolve_upm_id(query)
+        } else {
+            api.resolve_username(query)
+        };
         match result {
             Ok(entry) => {
                 if let Some(store) = &self.local_store {
                     match store.pin_or_verify_peer(&entry.device_id, &entry.identity_public_key) {
                         Ok(true) => {}
-                        Ok(false) => { self.status = "SECURITY: peer identity key changed; refusing contact".into(); return; }
-                        Err(e) => { self.status = format!("Local trust store error: {e}"); return; }
+                        Ok(false) => {
+                            self.status =
+                                "SECURITY: peer identity key changed; refusing contact".into();
+                            return;
+                        }
+                        Err(e) => {
+                            self.status = format!("Local trust store error: {e}");
+                            return;
+                        }
                     }
                 }
                 self.status = format!("Found @{} ({})", entry.username, entry.upm_id);
@@ -396,44 +494,101 @@ impl UpmApp {
                 self.conversation = None;
                 let _ = self.ensure_conversation();
             }
-            Err(e) => self.status = format!("Directory lookup failed: {e}"),
+            Err(e) => {
+                self.status = format!(
+                    "Directory lookup failed: {}",
+                    crate::api::friendly_message(&e)
+                )
+            }
         }
     }
 
     fn ensure_conversation(&mut self) -> Result<(), String> {
-        let Some(peer) = self.directory.clone() else { return Err("Resolve a contact first".into()); };
+        let Some(peer) = self.directory.clone() else {
+            return Err("Resolve a contact first".into());
+        };
         if let Some(conversation) = &self.conversation {
-            if conversation.peer.device_id == peer.device_id { return Ok(()); }
+            if conversation.peer.device_id == peer.device_id {
+                return Ok(());
+            }
         }
-        let mut conversation = Conversation { peer, session: None, lines: Vec::new() };
+        let mut conversation = Conversation {
+            peer,
+            session: None,
+            lines: Vec::new(),
+        };
         if let Some(store) = &self.local_store {
-            conversation.session = store.load_session(&conversation.peer.device_id).map_err(|e| e.to_string())?;
-            conversation.lines = store.load_messages(&conversation.peer.device_id).map_err(|e| e.to_string())?.into_iter().map(|(incoming, text, at)| ChatLine {
-                direction: if incoming { Direction::Incoming } else { Direction::Outgoing }, text, at,
-            }).collect();
+            conversation.session = store
+                .load_session(&conversation.peer.device_id)
+                .map_err(|e| e.to_string())?;
+            conversation.lines = store
+                .load_messages(&conversation.peer.device_id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|(incoming, text, at)| ChatLine {
+                    direction: if incoming {
+                        Direction::Incoming
+                    } else {
+                        Direction::Outgoing
+                    },
+                    text,
+                    at,
+                })
+                .collect();
         }
         self.conversation = Some(conversation);
         Ok(())
     }
 
-    fn make_initial_outgoing_packet(&mut self, plaintext: &[u8]) -> Result<(MessageEnvelope, DoubleRatchetSession), String> {
+    fn make_initial_outgoing_packet(
+        &mut self,
+        plaintext: &[u8],
+    ) -> Result<(MessageEnvelope, DoubleRatchetSession), String> {
         self.ensure_conversation()?;
-        let api = self.api.clone().ok_or_else(|| "Invalid server URL".to_string())?;
-        let my_device = decode_device_id(self.profile.device_id.as_deref().ok_or_else(|| "Register and authenticate first".to_string())?).map_err(|e| e.to_string())?;
+        let api = self
+            .api
+            .clone()
+            .ok_or_else(|| "Invalid server URL".to_string())?;
+        let my_device = decode_device_id(
+            self.profile
+                .device_id
+                .as_deref()
+                .ok_or_else(|| "Register and authenticate first".to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
         let peer = self.conversation.as_ref().unwrap().peer.clone();
         let peer_device = decode_device_id(&peer.device_id).map_err(|e| e.to_string())?;
-        let bundle_response = api.device_keys(&peer.device_id).map_err(|e| format!("key lookup failed: {e}"))?;
-        let expected_identity = decode_32(&bundle_response.identity_public_key).map_err(|e| e.to_string())?;
-        if expected_identity != decode_32(&peer.identity_public_key).map_err(|e| e.to_string())? { return Err("peer directory identity mismatch".into()); }
-        let exchange = decode_32(&bundle_response.identity_exchange_public).map_err(|e| e.to_string())?;
-        let signed_prekey = decode_32(&bundle_response.signed_prekey_public).map_err(|e| e.to_string())?;
-        let signed_sig = decode_64(&bundle_response.signed_prekey_signature).map_err(|e| e.to_string())?;
-        let claimed = api.claim_one_time_prekey(self.profile.session_token.as_deref().ok_or_else(|| "Authenticate first".to_string())?, &peer.device_id)
-            .map_err(|e| format!("OPK claim failed: {e}"))?;
+        let bundle_response = api
+            .device_keys(&peer.device_id)
+            .map_err(|e| crate::api::friendly_message(&e))?;
+        let expected_identity =
+            decode_32(&bundle_response.identity_public_key).map_err(|e| e.to_string())?;
+        if expected_identity != decode_32(&peer.identity_public_key).map_err(|e| e.to_string())? {
+            return Err("peer directory identity mismatch".into());
+        }
+        let exchange =
+            decode_32(&bundle_response.identity_exchange_public).map_err(|e| e.to_string())?;
+        let signed_prekey =
+            decode_32(&bundle_response.signed_prekey_public).map_err(|e| e.to_string())?;
+        let signed_sig =
+            decode_64(&bundle_response.signed_prekey_signature).map_err(|e| e.to_string())?;
+        let claimed = api
+            .claim_one_time_prekey(
+                self.profile
+                    .session_token
+                    .as_deref()
+                    .ok_or_else(|| "Authenticate first".to_string())?,
+                &peer.device_id,
+            )
+            .map_err(|e| crate::api::friendly_message(&e))?;
         let (opk_id, opk_public, opk_signature) = match claimed {
             Some((id, public, sig)) => {
                 let id = PreKeyId::from_hex(&id).ok_or_else(|| "invalid OPK id".to_string())?;
-                (Some(id), Some(decode_32(&public).map_err(|e| e.to_string())?), Some(decode_64(&sig).map_err(|e| e.to_string())?))
+                (
+                    Some(id),
+                    Some(decode_32(&public).map_err(|e| e.to_string())?),
+                    Some(decode_64(&sig).map_err(|e| e.to_string())?),
+                )
             }
             None => (None, None, None),
         };
@@ -446,7 +601,8 @@ impl UpmApp {
             one_time_prekey_public: opk_public,
             one_time_prekey_signature: opk_signature,
         };
-        let hs = handshake::initiate(&self.identity.exchange, &bundle).map_err(|e| e.to_string())?;
+        let hs =
+            handshake::initiate(&self.identity.exchange, &bundle).map_err(|e| e.to_string())?;
         if hs.one_time_prekey_id.is_none() {
             // SECURITY_REVIEW.md finding #2: the server can legitimately
             // report "no one-time prekey available", but a compromised
@@ -461,7 +617,12 @@ impl UpmApp {
                 peer.username
             );
         }
-        let mut session = DoubleRatchetSession::init_initiator(peer_device, &hs.result, hs.bob_initial_ratchet_public).map_err(|e| e.to_string())?;
+        let mut session = DoubleRatchetSession::init_initiator(
+            peer_device,
+            &hs.result,
+            hs.bob_initial_ratchet_public,
+        )
+        .map_err(|e| e.to_string())?;
         let mut bootstrap = SessionBootstrap {
             sender_identity_signing_public: self.identity.signing.public_key(),
             sender_identity_exchange_public: hs.my_identity_exchange_public,
@@ -469,73 +630,148 @@ impl UpmApp {
             one_time_prekey_id: hs.one_time_prekey_id,
             signature_base64: String::new(),
         };
-        let message = bootstrap_signature_message(peer_device, &bootstrap.sender_identity_exchange_public, &bootstrap.ephemeral_public, bootstrap.one_time_prekey_id);
-        bootstrap.signature_base64 = base64::engine::general_purpose::STANDARD.encode(self.identity.signing.sign(&message));
+        let message = bootstrap_signature_message(
+            peer_device,
+            &bootstrap.sender_identity_exchange_public,
+            &bootstrap.ephemeral_public,
+            bootstrap.one_time_prekey_id,
+        );
+        bootstrap.signature_base64 =
+            base64::engine::general_purpose::STANDARD.encode(self.identity.signing.sign(&message));
         let ratchet = session.encrypt(plaintext).map_err(|e| e.to_string())?;
-        let packet = SessionPacket { protocol_version: ProtocolVersion::CURRENT.0, bootstrap: Some(bootstrap), ratchet_message_base64: base64::engine::general_purpose::STANDARD.encode(ratchet) };
-        let envelope = MessageEnvelope { protocol_version: ProtocolVersion::CURRENT, message_id: MessageId::random(), sender_device_id: my_device, recipient_device_id: peer_device, ciphertext: encode_packet(&packet).map_err(|e| e.to_string())?, server_timestamp: 0, expires_at: 0 };
+        let packet = SessionPacket {
+            protocol_version: ProtocolVersion::CURRENT.0,
+            bootstrap: Some(bootstrap),
+            ratchet_message_base64: base64::engine::general_purpose::STANDARD.encode(ratchet),
+        };
+        let envelope = MessageEnvelope {
+            protocol_version: ProtocolVersion::CURRENT,
+            message_id: MessageId::random(),
+            sender_device_id: my_device,
+            recipient_device_id: peer_device,
+            ciphertext: encode_packet(&packet).map_err(|e| e.to_string())?,
+            server_timestamp: 0,
+            expires_at: 0,
+        };
         Ok((envelope, session))
     }
 
-    fn make_outgoing_packet(&mut self, payload: &[u8]) -> Result<(MessageEnvelope, DoubleRatchetSession), String> {
+    fn make_outgoing_packet(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<(MessageEnvelope, DoubleRatchetSession), String> {
         self.ensure_conversation()?;
-        let existing = self.conversation.as_ref().and_then(|c| c.session.as_ref()).cloned();
-        let Some(mut session) = existing else { return self.make_initial_outgoing_packet(payload); };
-        let my_device = decode_device_id(self.profile.device_id.as_deref().ok_or_else(|| "Register and authenticate first".to_string())?).map_err(|e| e.to_string())?;
-        let peer_device = decode_device_id(&self.conversation.as_ref().unwrap().peer.device_id).map_err(|e| e.to_string())?;
-        let ratchet_message = session.encrypt(payload).map_err(|e| format!("encryption failed: {e}"))?;
-        let packet = SessionPacket { protocol_version: ProtocolVersion::CURRENT.0, bootstrap: None, ratchet_message_base64: base64::engine::general_purpose::STANDARD.encode(ratchet_message) };
-        let envelope = MessageEnvelope { protocol_version: ProtocolVersion::CURRENT, message_id: MessageId::random(), sender_device_id: my_device, recipient_device_id: peer_device, ciphertext: encode_packet(&packet).map_err(|e| e.to_string())?, server_timestamp: 0, expires_at: 0 };
+        let existing = self
+            .conversation
+            .as_ref()
+            .and_then(|c| c.session.as_ref())
+            .cloned();
+        let Some(mut session) = existing else {
+            return self.make_initial_outgoing_packet(payload);
+        };
+        let my_device = decode_device_id(
+            self.profile
+                .device_id
+                .as_deref()
+                .ok_or_else(|| "Register and authenticate first".to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let peer_device = decode_device_id(&self.conversation.as_ref().unwrap().peer.device_id)
+            .map_err(|e| e.to_string())?;
+        let ratchet_message = session
+            .encrypt(payload)
+            .map_err(|e| format!("encryption failed: {e}"))?;
+        let packet = SessionPacket {
+            protocol_version: ProtocolVersion::CURRENT.0,
+            bootstrap: None,
+            ratchet_message_base64: base64::engine::general_purpose::STANDARD
+                .encode(ratchet_message),
+        };
+        let envelope = MessageEnvelope {
+            protocol_version: ProtocolVersion::CURRENT,
+            message_id: MessageId::random(),
+            sender_device_id: my_device,
+            recipient_device_id: peer_device,
+            ciphertext: encode_packet(&packet).map_err(|e| e.to_string())?,
+            server_timestamp: 0,
+            expires_at: 0,
+        };
         Ok((envelope, session))
     }
 
     fn send_payload(&mut self, payload: ChatPayload, display_text: String) {
-        let payload_bytes = match serde_json::to_vec(&payload) { Ok(v) => v, Err(e) => { self.status = format!("Payload encode failed: {e}"); return; } };
-        let Some(api) = self.api.clone() else { self.status = "Invalid server URL".into(); return; };
-        let Some(token) = self.profile.session_token.clone() else { self.status = "Authenticate first".into(); return; };
-        let (envelope, candidate_session) = match self.make_outgoing_packet(&payload_bytes) { Ok(v) => v, Err(e) => { self.status = e; return; } };
-        let outbox = OutboxItem { message_id: envelope.message_id, peer_device_id: envelope.recipient_device_id.to_hex(), envelope: envelope.clone(), session_after: candidate_session.snapshot(), text: display_text.clone() };
-        if let Some(store) = &self.local_store { if let Err(e) = store.save_outbox(&outbox) { self.status = format!("Local outbox save failed: {e}"); return; } }
-        match api.send_envelope(&token, &envelope) {
-            Ok(()) => {
-                if let Some(store) = &self.local_store { let _ = store.commit_outgoing_delivery(&outbox, &candidate_session, unix_now()); }
-                if let Some(conversation) = &mut self.conversation { conversation.session = Some(candidate_session); conversation.lines.push(ChatLine { direction: Direction::Outgoing, text: display_text, at: unix_now() }); }
-                self.status = "Encrypted message queued".into();
+        let payload_bytes = match serde_json::to_vec(&payload) {
+            Ok(v) => v,
+            Err(e) => {
+                self.status = format!("Payload encode failed: {e}");
+                return;
             }
-            Err(e) => self.status = format!("Send failed (outbox retained): {e}"),
-        }
-    }
-
-    fn reset_secure_session(&mut self) {
-        let Some(conversation) = self.conversation.as_ref() else {
-            self.status = "Resolve a contact first".into();
+        };
+        let Some(api) = self.api.clone() else {
+            self.status = "Invalid server URL".into();
             return;
         };
-        let peer_device = conversation.peer.device_id.clone();
-        if let Some(store) = &self.local_store {
-            match store.reset_session(&peer_device) {
-                Ok(()) => {
-                    if let Some(current) = &mut self.conversation {
-                        current.session = None;
-                    }
-                    self.status = "Secure session reset. Ask the contact to send a new message.".into();
-                }
-                Err(e) => self.status = format!("Secure session reset failed: {e}"),
+        let Some(token) = self.profile.session_token.clone() else {
+            self.status = "Authenticate first".into();
+            return;
+        };
+        let (envelope, candidate_session) = match self.make_outgoing_packet(&payload_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                self.status = e;
+                return;
             }
-        } else {
-            self.status = "Local secure store is unavailable".into();
+        };
+        let outbox = OutboxItem {
+            message_id: envelope.message_id,
+            peer_device_id: envelope.recipient_device_id.to_hex(),
+            envelope: envelope.clone(),
+            session_after: candidate_session.snapshot(),
+            text: display_text.clone(),
+        };
+        if let Some(store) = &self.local_store {
+            if let Err(e) = store.save_outbox(&outbox) {
+                self.status = format!("Local outbox save failed: {e}");
+                return;
+            }
+        }
+        match api.send_envelope(&token, &envelope) {
+            Ok(()) => {
+                if let Some(store) = &self.local_store {
+                    let _ = store.commit_outgoing_delivery(&outbox, &candidate_session, unix_now());
+                }
+                if let Some(conversation) = &mut self.conversation {
+                    conversation.session = Some(candidate_session);
+                    conversation.lines.push(ChatLine {
+                        direction: Direction::Outgoing,
+                        text: display_text,
+                        at: unix_now(),
+                    });
+                }
+                self.status = "Encrypted message queued".into();
+            }
+            Err(e) => {
+                self.status = format!(
+                    "Send failed, message kept locally to retry: {}",
+                    crate::api::friendly_message(&e)
+                )
+            }
         }
     }
 
     fn send_message(&mut self) {
         let text = self.message_input.trim().to_string();
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
         self.send_payload(ChatPayload::Text(text.clone()), text);
         self.message_input.clear();
     }
 
     fn send_attachment(&mut self) {
-        let Some(path) = FileDialog::new().set_title("Select attachment").pick_file() else { return; };
+        let Some(path) = FileDialog::new().set_title("Select attachment").pick_file() else {
+            return;
+        };
         match self.prepare_attachment(path) {
             Ok(()) => {}
             Err(e) => self.status = e,
@@ -545,35 +781,93 @@ impl UpmApp {
     fn prepare_attachment(&mut self, path: PathBuf) -> Result<(), String> {
         let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
         let size = meta.len();
-        if size == 0 || size > 100 * 1024 * 1024 { return Err("Attachment must be between 1 byte and 100 MB".into()); }
+        if size == 0 || size > 100 * 1024 * 1024 {
+            return Err("Attachment must be between 1 byte and 100 MB".into());
+        }
         let plaintext = std::fs::read(&path).map_err(|e| e.to_string())?;
         let key = attachments::AttachmentKey::generate();
-        let ciphertext_size = size.checked_add(attachments::NONCE_LEN as u64 + 16).ok_or_else(|| "attachment size overflow".to_string())?;
-        let api = self.api.clone().ok_or_else(|| "Invalid server URL".to_string())?;
-        let token = self.profile.session_token.clone().ok_or_else(|| "Authenticate first".to_string())?;
-        let (attachment_id, capability) = api.create_attachment(&token, ciphertext_size as i64).map_err(|e| format!("attachment slot failed: {e}"))?;
-        let id = MessageId::from_hex(&attachment_id).ok_or_else(|| "server returned invalid attachment id".to_string())?;
+        let ciphertext_size = size
+            .checked_add(attachments::NONCE_LEN as u64 + 16)
+            .ok_or_else(|| "attachment size overflow".to_string())?;
+        let api = self
+            .api
+            .clone()
+            .ok_or_else(|| "Invalid server URL".to_string())?;
+        let token = self
+            .profile
+            .session_token
+            .clone()
+            .ok_or_else(|| "Authenticate first".to_string())?;
+        let (attachment_id, capability) = api
+            .create_attachment(&token, ciphertext_size as i64)
+            .map_err(|e| crate::api::friendly_message(&e))?;
+        let id = MessageId::from_hex(&attachment_id)
+            .ok_or_else(|| "server returned invalid attachment id".to_string())?;
         let blob = attachments::encrypt(key, id, &plaintext).map_err(|e| e.to_string())?;
-        if blob.len() as u64 != ciphertext_size { return Err("attachment ciphertext size mismatch".into()); }
-        api.upload_attachment_blob(&token, &attachment_id, &blob).map_err(|e| format!("attachment upload failed: {e}"))?;
-        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("attachment").to_string();
-        let payload = ChatPayload::Attachment { attachment_id: id, filename: filename.clone(), size, key: key.0, capability };
+        if blob.len() as u64 != ciphertext_size {
+            return Err("attachment ciphertext size mismatch".into());
+        }
+        api.upload_attachment_blob(&token, &attachment_id, &blob)
+            .map_err(|e| crate::api::friendly_message(&e))?;
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let payload = ChatPayload::Attachment {
+            attachment_id: id,
+            filename: filename.clone(),
+            size,
+            key: key.0,
+            capability,
+        };
         self.send_payload(payload, format!("📎 {filename} ({size} bytes)"));
         Ok(())
     }
 
-    fn establish_responder_session(&mut self, sender_device: DeviceId, bootstrap: &SessionBootstrap) -> Result<(DoubleRatchetSession, Option<PreKeyId>), ClientCryptoError> {
-        let directory = self.directory.as_ref().ok_or(ClientCryptoError::PeerIdentityMismatch)?;
-        if directory.device_id != sender_device.to_hex() { return Err(ClientCryptoError::PeerIdentityMismatch); }
-        let expected_identity = decode_32(&directory.identity_public_key).map_err(|_| ClientCryptoError::PeerIdentityMismatch)?;
-        if expected_identity != bootstrap.sender_identity_signing_public { return Err(ClientCryptoError::PeerIdentityMismatch); }
-        let my_device = decode_device_id(self.profile.device_id.as_deref().ok_or(ClientCryptoError::PeerIdentityMismatch)?)?;
+    fn establish_responder_session(
+        &mut self,
+        sender_device: DeviceId,
+        bootstrap: &SessionBootstrap,
+    ) -> Result<(DoubleRatchetSession, Option<PreKeyId>), ClientCryptoError> {
+        let directory = self
+            .directory
+            .as_ref()
+            .ok_or(ClientCryptoError::PeerIdentityMismatch)?;
+        if directory.device_id != sender_device.to_hex() {
+            return Err(ClientCryptoError::PeerIdentityMismatch);
+        }
+        let expected_identity = decode_32(&directory.identity_public_key)
+            .map_err(|_| ClientCryptoError::PeerIdentityMismatch)?;
+        if expected_identity != bootstrap.sender_identity_signing_public {
+            return Err(ClientCryptoError::PeerIdentityMismatch);
+        }
+        let my_device = decode_device_id(
+            self.profile
+                .device_id
+                .as_deref()
+                .ok_or(ClientCryptoError::PeerIdentityMismatch)?,
+        )?;
         verify_bootstrap(bootstrap, my_device)?;
-        let opk = bootstrap.one_time_prekey_id.and_then(|id| self.identity.find_one_time_prekey(id));
-        if bootstrap.one_time_prekey_id.is_some() && opk.is_none() { return Err(ClientCryptoError::MissingOneTimePrekey); }
+        let opk = bootstrap
+            .one_time_prekey_id
+            .and_then(|id| self.identity.find_one_time_prekey(id));
+        if bootstrap.one_time_prekey_id.is_some() && opk.is_none() {
+            return Err(ClientCryptoError::MissingOneTimePrekey);
+        }
         let sender_exchange = bootstrap.sender_identity_exchange_public;
-        let hs = handshake::respond(&self.identity.exchange, &self.identity.signed_prekey, &sender_exchange, &bootstrap.ephemeral_public, opk)?;
-        let session = DoubleRatchetSession::init_responder(sender_device, &hs, self.identity.signed_prekey.clone());
+        let hs = handshake::respond(
+            &self.identity.exchange,
+            &self.identity.signed_prekey,
+            &sender_exchange,
+            &bootstrap.ephemeral_public,
+            opk,
+        )?;
+        let session = DoubleRatchetSession::init_responder(
+            sender_device,
+            &hs,
+            self.identity.signed_prekey.clone(),
+        );
         if bootstrap.one_time_prekey_id.is_none() {
             // Symmetric to the initiator-side note in make_initial_outgoing_packet:
             // this incoming handshake didn't claim a one-time prekey. Make that
@@ -584,14 +878,17 @@ impl UpmApp {
     }
 
     fn retry_outbox(&mut self, api: &ApiClient, token: &str) {
-        let Some(store) = &self.local_store else { return; };
+        let Some(store) = &self.local_store else {
+            return;
+        };
         let items = match store.load_outbox() {
             Ok(v) => v,
             Err(_) => return,
         };
         for item in items {
             if api.send_envelope(token, &item.envelope).is_ok() {
-                if let Ok(session) = DoubleRatchetSession::from_snapshot(item.session_after.clone()) {
+                if let Ok(session) = DoubleRatchetSession::from_snapshot(item.session_after.clone())
+                {
                     let _ = store.commit_outgoing_delivery(&item, &session, unix_now());
                 }
             }
@@ -599,38 +896,129 @@ impl UpmApp {
     }
 
     fn poll(&mut self) {
-        let (Some(api), Some(token), Some(device_id)) = (self.api.clone(), self.profile.session_token.clone(), self.profile.device_id.clone()) else { return; };
+        let (Some(api), Some(token), Some(device_id)) = (
+            self.api.clone(),
+            self.profile.session_token.clone(),
+            self.profile.device_id.clone(),
+        ) else {
+            return;
+        };
         self.retry_outbox(&api, &token);
-        let items = match api.pull(&token, &device_id) { Ok(v) => v, Err(e) => { self.status = format!("Pull failed: {e}"); return; } };
-        if items.is_empty() { return; }
+        let items = match api.pull(&token, &device_id) {
+            Ok(v) => v,
+            Err(e) => {
+                // Only announce a connectivity problem once (when it
+                // starts), not on every ~2-second retry — otherwise this
+                // constantly overwrites whatever the user was actually
+                // looking at (a send confirmation, a resolve result...).
+                if !self.poll_is_failing {
+                    self.poll_is_failing = true;
+                    self.status = format!("Connection lost: {}", crate::api::friendly_message(&e));
+                }
+                return;
+            }
+        };
+        if self.poll_is_failing {
+            self.poll_is_failing = false;
+            self.status = "Connection restored".into();
+        }
+        if items.is_empty() {
+            return;
+        }
         let mut ack_ids = Vec::new();
         let mut count = 0usize;
         for item in items {
-            let msg_id = match MessageId::from_hex(&item.message_id) { Some(v) => v, None => continue };
-            let sender_device = match decode_device_id(&item.sender_device_id) { Ok(v) => v, Err(_) => continue };
+            let msg_id = match MessageId::from_hex(&item.message_id) {
+                Some(v) => v,
+                None => continue,
+            };
+            let sender_device = match decode_device_id(&item.sender_device_id) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
             if let Some(store) = &self.local_store {
-                if store.is_message_processed(msg_id, &item.sender_device_id).unwrap_or(false) { ack_ids.push(item.message_id.clone()); continue; }
+                if store
+                    .is_message_processed(msg_id, &item.sender_device_id)
+                    .unwrap_or(false)
+                {
+                    ack_ids.push(item.message_id.clone());
+                    continue;
+                }
             }
-            let raw = match base64::engine::general_purpose::STANDARD.decode(&item.ciphertext_base64) { Ok(v) => v, Err(_) => continue };
-            let packet = match decode_packet(&raw) { Ok(v) => v, Err(_) => continue };
-            if packet.protocol_version != ProtocolVersion::CURRENT.0 { continue; }
-            let ratchet_wire = match base64::engine::general_purpose::STANDARD.decode(&packet.ratchet_message_base64) { Ok(v) => v, Err(_) => continue };
-            let peer_known = self.conversation.as_ref().map(|c| c.peer.device_id == sender_device.to_hex()).unwrap_or(false);
+            let raw =
+                match base64::engine::general_purpose::STANDARD.decode(&item.ciphertext_base64) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+            let packet = match decode_packet(&raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if packet.protocol_version != ProtocolVersion::CURRENT.0 {
+                continue;
+            }
+            let ratchet_wire = match base64::engine::general_purpose::STANDARD
+                .decode(&packet.ratchet_message_base64)
+            {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let peer_known = self
+                .conversation
+                .as_ref()
+                .map(|c| c.peer.device_id == sender_device.to_hex())
+                .unwrap_or(false);
             if !peer_known {
-                let Some(bootstrap) = packet.bootstrap.as_ref() else { continue; };
-                if let Some(store) = &self.local_store { if !store.pin_or_verify_peer(&sender_device.to_hex(), &base64::engine::general_purpose::STANDARD.encode(bootstrap.sender_identity_signing_public)).unwrap_or(false) { self.status = "SECURITY: incoming identity key mismatch".into(); continue; } }
-                let entry = match &self.directory { Some(e) if e.device_id == sender_device.to_hex() => e.clone(), _ => DirectoryEntry { upm_id: String::new(), username: String::new(), device_id: sender_device.to_hex(), identity_public_key: base64::engine::general_purpose::STANDARD.encode(bootstrap.sender_identity_signing_public) } };
+                let Some(bootstrap) = packet.bootstrap.as_ref() else {
+                    continue;
+                };
+                if let Some(store) = &self.local_store {
+                    if !store
+                        .pin_or_verify_peer(
+                            &sender_device.to_hex(),
+                            &base64::engine::general_purpose::STANDARD
+                                .encode(bootstrap.sender_identity_signing_public),
+                        )
+                        .unwrap_or(false)
+                    {
+                        self.status = "SECURITY: incoming identity key mismatch".into();
+                        continue;
+                    }
+                }
+                let entry = match &self.directory {
+                    Some(e) if e.device_id == sender_device.to_hex() => e.clone(),
+                    _ => DirectoryEntry {
+                        upm_id: String::new(),
+                        username: String::new(),
+                        device_id: sender_device.to_hex(),
+                        identity_public_key: base64::engine::general_purpose::STANDARD
+                            .encode(bootstrap.sender_identity_signing_public),
+                    },
+                };
                 self.directory = Some(entry.clone());
                 match self.establish_responder_session(sender_device, bootstrap) {
                     Ok((session, _claimed_opk)) => {
-                        self.conversation = Some(Conversation { peer: entry, session: Some(session), lines: Vec::new() });
+                        self.conversation = Some(Conversation {
+                            peer: entry,
+                            session: Some(session),
+                            lines: Vec::new(),
+                        });
                     }
-                    Err(e) => { self.status = format!("Peer authentication failed: {e}"); continue; }
+                    Err(e) => {
+                        self.status = format!("Peer authentication failed: {e}");
+                        continue;
+                    }
                 }
             }
-            let Some(conversation) = self.conversation.as_mut() else { continue; };
-            if conversation.peer.device_id != sender_device.to_hex() { continue; }
-            let Some(session) = conversation.session.as_mut() else { continue; };
+            let Some(conversation) = self.conversation.as_mut() else {
+                continue;
+            };
+            if conversation.peer.device_id != sender_device.to_hex() {
+                continue;
+            }
+            let Some(session) = conversation.session.as_mut() else {
+                continue;
+            };
             let plaintext = match session.decrypt(&ratchet_wire) {
                 Ok(v) => v,
                 Err(upm_core::SessionError::TooManySkipped) => {
@@ -648,25 +1036,50 @@ impl UpmApp {
                     continue;
                 }
                 Err(e) => {
-                    self.status = format!(
-                        "Message authentication failed: {e}. If one side was reinstalled, reset, or lost its session, use Reset secure session and have the contact send a new message."
-                    );
+                    self.status = format!("Message authentication failed: {e}");
                     continue;
                 }
             };
-            let payload = match serde_json::from_slice::<ChatPayload>(&plaintext) { Ok(v) => v, Err(_) => { self.status = "Decrypted payload has unsupported format".into(); continue; } };
+            let payload = match serde_json::from_slice::<ChatPayload>(&plaintext) {
+                Ok(v) => v,
+                Err(_) => {
+                    self.status = "Decrypted payload has unsupported format".into();
+                    continue;
+                }
+            };
             let display = match payload {
                 ChatPayload::Text(text) => text,
-                ChatPayload::Attachment { attachment_id, filename, size, key, capability } => {
+                ChatPayload::Attachment {
+                    attachment_id,
+                    filename,
+                    size,
+                    key,
+                    capability,
+                } => {
                     let path = PathBuf::from(&filename);
-                    match api.download_attachment_blob(&token, &attachment_id.to_hex(), &capability) {
-                        Ok(blob) => match attachments::decrypt(attachments::AttachmentKey(key), attachment_id, &blob) {
+                    match api.download_attachment_blob(&token, &attachment_id.to_hex(), &capability)
+                    {
+                        Ok(blob) => match attachments::decrypt(
+                            attachments::AttachmentKey(key),
+                            attachment_id,
+                            &blob,
+                        ) {
                             Ok(data) => {
-                                let safe_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("attachment.bin");
+                                let safe_name = path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("attachment.bin");
                                 let target = downloads_dir().join(safe_name);
-                                match std::fs::create_dir_all(downloads_dir()).and_then(|_| std::fs::write(&target, data)) {
-                                    Ok(()) => format!("📎 {filename} ({size} bytes) saved to {}", target.display()),
-                                    Err(_) => format!("📎 {filename} ({size} bytes) — download failed"),
+                                match std::fs::create_dir_all(downloads_dir())
+                                    .and_then(|_| std::fs::write(&target, data))
+                                {
+                                    Ok(()) => format!(
+                                        "📎 {filename} ({size} bytes) saved to {}",
+                                        target.display()
+                                    ),
+                                    Err(_) => {
+                                        format!("📎 {filename} ({size} bytes) — download failed")
+                                    }
                                 }
                             }
                             Err(_) => format!("📎 {filename} — attachment authentication failed"),
@@ -676,7 +1089,16 @@ impl UpmApp {
                 }
             };
             if let Some(store) = &self.local_store {
-                if let Err(e) = store.commit_incoming_message(&conversation.peer.device_id, msg_id, &display, session, unix_now()) { self.status = format!("Local commit failed: {e}"); continue; }
+                if let Err(e) = store.commit_incoming_message(
+                    &conversation.peer.device_id,
+                    msg_id,
+                    &display,
+                    session,
+                    unix_now(),
+                ) {
+                    self.status = format!("Local commit failed: {e}");
+                    continue;
+                }
             }
             if let Some(bootstrap) = packet.bootstrap.as_ref() {
                 if let Some(opk_id) = bootstrap.one_time_prekey_id {
@@ -685,12 +1107,24 @@ impl UpmApp {
                     persist_identity_secrets(&self.identity);
                 }
             }
-            conversation.lines.push(ChatLine { direction: Direction::Incoming, text: display, at: unix_now() });
+            conversation.lines.push(ChatLine {
+                direction: Direction::Incoming,
+                text: display,
+                at: unix_now(),
+            });
             ack_ids.push(item.message_id);
             count += 1;
         }
         if !ack_ids.is_empty() {
-            match api.ack(&token, &ack_ids) { Ok(_) => self.status = format!("Processed and acknowledged {count} message(s)"), Err(e) => self.status = format!("Processed {count}; ACK failed: {e}") }
+            match api.ack(&token, &ack_ids) {
+                Ok(_) => self.status = format!("Processed and acknowledged {count} message(s)"),
+                Err(e) => {
+                    self.status = format!(
+                        "Processed {count}; ACK failed: {}",
+                        crate::api::friendly_message(&e)
+                    )
+                }
+            }
         }
         if self.identity.one_time_prekeys.len() < 4 {
             self.identity.ensure_one_time_prekey_pool(12);
@@ -701,7 +1135,11 @@ impl UpmApp {
 }
 
 fn downloads_dir() -> PathBuf {
-    if let Ok(profile) = std::env::var("USERPROFILE") { PathBuf::from(profile).join("Downloads").join("UPM") } else { PathBuf::from("upm-downloads") }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        PathBuf::from(profile).join("Downloads").join("UPM")
+    } else {
+        PathBuf::from("upm-downloads")
+    }
 }
 
 impl eframe::App for UpmApp {
@@ -715,7 +1153,9 @@ impl eframe::App for UpmApp {
 
         let connected = self.api.is_some();
         let authenticated = self.profile.session_token.is_some();
-        let (status_color, status_word) = if authenticated {
+        let (status_color, status_word) = if self.poll_is_failing {
+            (egui::Color32::from_rgb(0xb0, 0x3a, 0x3a), "Connection lost")
+        } else if authenticated {
             (egui::Color32::from_rgb(0x2e, 0xa0, 0x4f), "Authenticated")
         } else if connected {
             (egui::Color32::from_rgb(0xd0, 0x9a, 0x1e), "Connected")
@@ -736,125 +1176,150 @@ impl eframe::App for UpmApp {
             ui.add_space(4.0);
         });
 
-        egui::SidePanel::left("sidebar").resizable(true).default_width(280.0).show(ctx, |ui| {
-            ui.add_space(6.0);
+        egui::SidePanel::left("sidebar")
+            .resizable(true)
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
 
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new("Server").strong());
-                ui.add_space(4.0);
-                ui.text_edit_singleline(&mut self.profile.server_url);
-                ui.add_space(4.0);
-                if ui.button("Connect").clicked() { self.reconnect(); }
-            });
-
-            ui.add_space(8.0);
-
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new("Identity").strong());
-                ui.add_space(4.0);
-                ui.add_enabled_ui(!authenticated, |ui| {
-                    ui.text_edit_singleline(&mut self.profile.username);
-                });
-                ui.add_space(4.0);
-                let has_account = self.profile.device_id.is_some();
-                ui.horizontal_wrapped(|ui| {
-                    if authenticated {
-                        if ui.button("Log out").clicked() { self.logout(); }
-                    } else {
-                        // Keep the Login action visible at all times so a fresh
-                        // install does not look like login is missing. On a
-                        // truly fresh install there is no local device_id yet,
-                        // so the button remains disabled until an account has
-                        // been created on this device.
-                        ui.add_enabled_ui(has_account, |ui| {
-                            let response = ui.button("Log in");
-                            if response.clicked() { self.authenticate(); }
-                            if !has_account {
-                                response.on_hover_text("Create an account on this device first.");
-                            }
-                        });
-                        if ui.button("Create account").clicked() { self.register(); }
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(egui::RichText::new("Server").strong());
+                    ui.add_space(4.0);
+                    ui.text_edit_singleline(&mut self.profile.server_url);
+                    ui.add_space(4.0);
+                    if ui.button("Connect").clicked() {
+                        self.reconnect();
                     }
                 });
-                ui.add_space(6.0);
-                if let Some(id) = &self.profile.upm_id { ui.label(format!("UPM ID: {id}")); }
-                if let Some(d) = &self.profile.device_id { ui.small(egui::RichText::new(format!("Device: {d}")).monospace().weak()); }
-                if authenticated {
-                    ui.small(format!("Protocol: v{}", ProtocolVersion::CURRENT.0));
-                    if let Some(expires) = self.profile.session_expires_at { ui.small(format!("Session expires: {expires}")); }
-                }
-                ui.add_space(6.0);
-                let identity_pub = self.identity.signing.public_key();
-                egui::Frame::none()
-                    .fill(ui.visuals().extreme_bg_color)
-                    .rounding(4.0)
-                    .inner_margin(6.0)
-                    .show(ui, |ui| {
-                        ui.small(egui::RichText::new(fingerprint_hex(&identity_pub)).monospace());
-                    });
-                if authenticated {
+
+                ui.add_space(8.0);
+
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(egui::RichText::new("Identity").strong());
                     ui.add_space(4.0);
-                    let response = ui.checkbox(&mut self.directory_visible, "Discoverable in directory");
-                    if response.changed() { self.update_directory_visibility(); }
-                }
-            });
-
-            ui.add_space(8.0);
-
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new("Contact").strong());
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.new_contact);
-                    if ui.button("Resolve").clicked() { self.resolve(); }
-                });
-                if let Some(entry) = &self.directory {
+                    ui.add_enabled_ui(!authenticated, |ui| {
+                        ui.text_edit_singleline(&mut self.profile.username);
+                    });
+                    ui.add_space(4.0);
+                    let has_account = self.profile.device_id.is_some();
+                    ui.horizontal_wrapped(|ui| {
+                        if authenticated {
+                            if ui.button("Log out").clicked() {
+                                self.logout();
+                            }
+                        } else if has_account {
+                            if ui.button("Log in").clicked() {
+                                self.authenticate();
+                            }
+                            if ui.small_button("Register new account").clicked() {
+                                self.register();
+                            }
+                        } else {
+                            if ui.button("Register").clicked() {
+                                self.register();
+                            }
+                        }
+                    });
                     ui.add_space(6.0);
+                    if let Some(id) = &self.profile.upm_id {
+                        ui.label(format!("UPM ID: {id}"));
+                    }
+                    if let Some(d) = &self.profile.device_id {
+                        ui.small(
+                            egui::RichText::new(format!("Device: {d}"))
+                                .monospace()
+                                .weak(),
+                        );
+                    }
+                    if authenticated {
+                        ui.small(format!("Protocol: v{}", ProtocolVersion::CURRENT.0));
+                        if let Some(expires) = self.profile.session_expires_at {
+                            ui.small(format!("Session expires: {expires}"));
+                        }
+                    }
+                    ui.add_space(6.0);
+                    let identity_pub = self.identity.signing.public_key();
                     egui::Frame::none()
-                        .fill(ui.visuals().faint_bg_color)
+                        .fill(ui.visuals().extreme_bg_color)
                         .rounding(4.0)
                         .inner_margin(6.0)
                         .show(ui, |ui| {
-                            ui.label(egui::RichText::new(format!("@{}", entry.username)).strong());
-                            ui.small(&entry.upm_id);
-                            ui.small(egui::RichText::new(format!("Device: {}", entry.device_id)).weak());
+                            ui.small(
+                                egui::RichText::new(fingerprint_hex(&identity_pub)).monospace(),
+                            );
                         });
-                    // Safety number: read this aloud with your contact over
-                    // an independent channel (in person, a phone call) to
-                    // confirm you're both pinned to the same identity key.
-                    // TOFU alone only catches a key *changing later* — it
-                    // can't catch a compromised directory server lying on
-                    // the very first lookup (SECURITY_REVIEW.md finding #1).
-                    if let Ok(their_key) = decode_32(&entry.identity_public_key) {
-                        let my_key = self.identity.signing.public_key();
+                    if authenticated {
+                        ui.add_space(4.0);
+                        let response =
+                            ui.checkbox(&mut self.directory_visible, "Discoverable in directory");
+                        if response.changed() {
+                            self.update_directory_visibility();
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(egui::RichText::new("Contact").strong());
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.new_contact);
+                        if ui.button("Resolve").clicked() {
+                            self.resolve();
+                        }
+                    });
+                    if let Some(entry) = &self.directory {
                         ui.add_space(6.0);
-                        ui.small(egui::RichText::new("Safety number (compare with your contact):").weak());
                         egui::Frame::none()
-                            .fill(ui.visuals().extreme_bg_color)
+                            .fill(ui.visuals().faint_bg_color)
                             .rounding(4.0)
                             .inner_margin(6.0)
                             .show(ui, |ui| {
-                                ui.small(egui::RichText::new(safety_number(&my_key, &their_key)).monospace());
+                                ui.label(
+                                    egui::RichText::new(format!("@{}", entry.username)).strong(),
+                                );
+                                ui.small(&entry.upm_id);
+                                ui.small(
+                                    egui::RichText::new(format!("Device: {}", entry.device_id))
+                                        .weak(),
+                                );
                             });
-                    }
-                    if self.conversation.as_ref().and_then(|c| c.session.as_ref()).is_some() {
-                        ui.add_space(6.0);
-                        if ui.button("Reset secure session").clicked() {
-                            self.reset_secure_session();
+                        // Safety number: read this aloud with your contact over
+                        // an independent channel (in person, a phone call) to
+                        // confirm you're both pinned to the same identity key.
+                        // TOFU alone only catches a key *changing later* — it
+                        // can't catch a compromised directory server lying on
+                        // the very first lookup (SECURITY_REVIEW.md finding #1).
+                        if let Ok(their_key) = decode_32(&entry.identity_public_key) {
+                            let my_key = self.identity.signing.public_key();
+                            ui.add_space(6.0);
+                            ui.small(
+                                egui::RichText::new("Safety number (compare with your contact):")
+                                    .weak(),
+                            );
+                            egui::Frame::none()
+                                .fill(ui.visuals().extreme_bg_color)
+                                .rounding(4.0)
+                                .inner_margin(6.0)
+                                .show(ui, |ui| {
+                                    ui.small(
+                                        egui::RichText::new(safety_number(&my_key, &their_key))
+                                            .monospace(),
+                                    );
+                                });
                         }
-                        ui.small(egui::RichText::new(
-                            "Use this after a reinstall/session loss. Chat history is kept; pending messages from the old session are discarded.",
-                        ).weak());
                     }
+                });
+
+                ui.add_space(8.0);
+                if ui.button("⟳  Pull now").clicked() {
+                    self.poll();
                 }
             });
-
-            ui.add_space(8.0);
-            if ui.button("⟳  Pull now").clicked() { self.poll(); }
-        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if !authenticated {
@@ -928,7 +1393,11 @@ mod safety_number_tests {
     fn safety_number_is_symmetric_regardless_of_argument_order() {
         let a = [0x11u8; 32];
         let b = [0x22u8; 32];
-        assert_eq!(safety_number(&a, &b), safety_number(&b, &a), "both conversation partners must compute the same safety number");
+        assert_eq!(
+            safety_number(&a, &b),
+            safety_number(&b, &a),
+            "both conversation partners must compute the same safety number"
+        );
     }
 
     #[test]

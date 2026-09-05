@@ -100,7 +100,13 @@ pub struct PreKeyId(pub [u8; 16]);
 pub struct DeviceId(pub [u8; 16]);
 
 fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02X}")).collect()
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
+            let _ = write!(out, "{b:02X}");
+            out
+        })
 }
 
 fn decode_hex_16(value: &str) -> Option<[u8; 16]> {
@@ -166,8 +172,11 @@ impl<'de> Deserialize<'de> for MessageId {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        MessageId::from_hex(&value)
-            .ok_or_else(|| serde::de::Error::custom("message_id must be exactly 16 bytes encoded as 32 hex characters"))
+        MessageId::from_hex(&value).ok_or_else(|| {
+            serde::de::Error::custom(
+                "message_id must be exactly 16 bytes encoded as 32 hex characters",
+            )
+        })
     }
 }
 
@@ -186,8 +195,11 @@ impl<'de> Deserialize<'de> for DeviceId {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        DeviceId::from_hex(&value)
-            .ok_or_else(|| serde::de::Error::custom("device_id must be exactly 16 bytes encoded as 32 hex characters"))
+        DeviceId::from_hex(&value).ok_or_else(|| {
+            serde::de::Error::custom(
+                "device_id must be exactly 16 bytes encoded as 32 hex characters",
+            )
+        })
     }
 }
 

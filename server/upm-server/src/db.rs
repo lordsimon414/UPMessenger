@@ -165,7 +165,7 @@ const UPM_ID_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ"; // no 0/O/1/
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::thread_rng().fill_bytes(&mut buf);
-    buf.iter().map(|b| format!("{:02X}", b)).collect()
+    crate::util::hex_encode(&buf, true)
 }
 
 /// Human-manageable public account identifier (SRS §7), e.g. "7F3A-91D2-4C2M".
@@ -275,6 +275,146 @@ pub struct DirectoryEntry {
 
 /// Resolves a username to public directory data only — never anything
 /// beyond what SRS §16 lists as the minimum for `/v1/directory/resolve`.
+// ---------------------------------------------------------------------
+// Local admin dashboard support (beta-testing convenience — see
+// admin.rs). Every function here is read-heavy or destructive and MUST
+// only ever be reachable from the loopback-only admin listener, never
+// from the main tunneled API.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, serde::Serialize)]
+pub struct AdminStats {
+    pub account_count: i64,
+    pub device_count: i64,
+    pub queued_message_count: i64,
+    pub attachment_count: i64,
+    pub attachment_bytes_total: i64,
+}
+
+pub fn admin_stats(conn: &Connection) -> Result<AdminStats, DbError> {
+    let account_count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
+    let device_count: i64 = conn.query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0))?;
+    let queued_message_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM message_envelopes WHERE delivery_state = 'queued'",
+        [],
+        |r| r.get(0),
+    )?;
+    let attachment_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0))?;
+    let attachment_bytes_total: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(opaque_size), 0) FROM attachments",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(AdminStats {
+        account_count,
+        device_count,
+        queued_message_count,
+        attachment_count,
+        attachment_bytes_total,
+    })
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AdminAccountSummary {
+    pub username: String,
+    pub upm_id: String,
+    pub created_at: i64,
+    pub device_count: i64,
+    pub directory_visible: bool,
+}
+
+pub fn admin_list_accounts(conn: &Connection) -> Result<Vec<AdminAccountSummary>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT u.username, u.upm_id, u.created_at, u.directory_visible,
+                (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.user_id)
+         FROM users u ORDER BY u.created_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(AdminAccountSummary {
+            username: row.get(0)?,
+            upm_id: row.get(1)?,
+            created_at: row.get(2)?,
+            directory_visible: row.get::<_, i64>(3)? != 0,
+            device_count: row.get(4)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+}
+
+/// Deletes an account and everything tied to it (devices, one-time
+/// prekeys, auth sessions/challenges, queued messages sent *or* received
+/// by any of its devices, and attachment rows) in one transaction.
+/// Returns the `storage_key`s of every deleted attachment so the caller
+/// (which owns `attachment_dir`, a filesystem concern this module doesn't
+/// know about) can unlink the corresponding blob files — same pattern as
+/// `reap_expired_with_attachment_keys`.
+///
+/// This is irreversible and exists specifically for beta-testing
+/// convenience (reclaiming a username after local device state was lost
+/// during testing) — it is not a feature intended for end users to invoke
+/// on themselves or others.
+pub fn admin_delete_account(conn: &Connection, username: &str) -> Result<Vec<String>, DbError> {
+    let normalized = username.to_lowercase();
+    let user_id: Option<String> = conn
+        .query_row(
+            "SELECT user_id FROM users WHERE username_normalized = ?1",
+            params![normalized],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(user_id) = user_id else {
+        return Err(DbError::UserNotFound);
+    };
+
+    let device_ids: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT device_id FROM devices WHERE user_id = ?1")?;
+        let rows = stmt.query_map(params![user_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut storage_keys = Vec::new();
+    for device_id in &device_ids {
+        let mut stmt =
+            conn.prepare("SELECT storage_key FROM attachments WHERE owner_device_id = ?1")?;
+        let keys = stmt.query_map(params![device_id], |r| r.get::<_, String>(0))?;
+        for key in keys {
+            storage_keys.push(key?);
+        }
+
+        conn.execute(
+            "DELETE FROM attachments WHERE owner_device_id = ?1",
+            params![device_id],
+        )?;
+        conn.execute(
+            "DELETE FROM one_time_prekeys WHERE device_id = ?1",
+            params![device_id],
+        )?;
+        conn.execute(
+            "DELETE FROM message_envelopes WHERE sender_device_id = ?1 OR recipient_device_id = ?1",
+            params![device_id],
+        )?;
+        // sessions/auth_challenges live in auth.rs's schema, same database.
+        conn.execute(
+            "DELETE FROM sessions WHERE device_id = ?1",
+            params![device_id],
+        )?;
+        conn.execute(
+            "DELETE FROM auth_challenges WHERE device_id = ?1",
+            params![device_id],
+        )?;
+    }
+
+    conn.execute(
+        "DELETE FROM memberships WHERE user_id = ?1",
+        params![user_id],
+    )?;
+    conn.execute("DELETE FROM devices WHERE user_id = ?1", params![user_id])?;
+    conn.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
+
+    Ok(storage_keys)
+}
+
 pub fn resolve_username(
     conn: &Connection,
     username: &str,
@@ -302,10 +442,7 @@ pub fn resolve_username(
     Ok(result)
 }
 
-pub fn resolve_upm_id(
-    conn: &Connection,
-    upm_id: &str,
-) -> Result<Option<DirectoryEntry>, DbError> {
+pub fn resolve_upm_id(conn: &Connection, upm_id: &str) -> Result<Option<DirectoryEntry>, DbError> {
     let result = conn
         .query_row(
             "SELECT u.upm_id, u.username, d.device_id, d.identity_public_key
@@ -510,7 +647,11 @@ pub fn claim_one_time_prekey(
     )?;
     tx.commit()?;
     if changed == 1 {
-        Ok(Some(OneTimePreKeyRecord { prekey_id, public_key, signature }))
+        Ok(Some(OneTimePreKeyRecord {
+            prekey_id,
+            public_key,
+            signature,
+        }))
     } else {
         Ok(None)
     }
@@ -530,14 +671,27 @@ pub fn claim_one_time_prekey(
 pub fn reap_expired_with_attachment_keys(conn: &Connection) -> Result<Vec<String>, DbError> {
     let now_ts = now();
     let storage_keys: Vec<String> = {
-        let mut stmt = conn.prepare("SELECT storage_key FROM attachments WHERE expires_at <= ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT storage_key FROM attachments WHERE expires_at <= ?1")?;
         let rows = stmt.query_map(params![now_ts], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    conn.execute("DELETE FROM message_envelopes WHERE expires_at <= ?1", params![now_ts])?;
-    conn.execute("DELETE FROM attachments WHERE expires_at <= ?1", params![now_ts])?;
-    conn.execute("DELETE FROM auth_challenges WHERE expires_at <= ?1", params![now_ts])?;
-    conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now_ts])?;
+    conn.execute(
+        "DELETE FROM message_envelopes WHERE expires_at <= ?1",
+        params![now_ts],
+    )?;
+    conn.execute(
+        "DELETE FROM attachments WHERE expires_at <= ?1",
+        params![now_ts],
+    )?;
+    conn.execute(
+        "DELETE FROM auth_challenges WHERE expires_at <= ?1",
+        params![now_ts],
+    )?;
+    conn.execute(
+        "DELETE FROM sessions WHERE expires_at <= ?1",
+        params![now_ts],
+    )?;
     Ok(storage_keys)
 }
 
@@ -701,7 +855,7 @@ pub fn ack_messages(
 fn hash_capability(capability: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(capability.as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    crate::util::hex_encode(&digest, false)
 }
 
 pub fn attachment_capability_matches(record: &AttachmentRecord, capability: &str) -> bool {
@@ -710,7 +864,7 @@ pub fn attachment_capability_matches(record: &AttachmentRecord, capability: &str
         return false;
     }
     let digest = Sha256::digest(capability.as_bytes());
-    let candidate: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let candidate: String = crate::util::hex_encode(&digest, false);
     candidate == record.capability_hash
 }
 
@@ -791,7 +945,10 @@ pub struct AttachmentRecord {
     pub uploaded: bool,
 }
 
-pub fn get_attachment(conn: &Connection, attachment_id: &str) -> Result<Option<AttachmentRecord>, DbError> {
+pub fn get_attachment(
+    conn: &Connection,
+    attachment_id: &str,
+) -> Result<Option<AttachmentRecord>, DbError> {
     Ok(conn.query_row(
         "SELECT attachment_id, owner_device_id, opaque_size, storage_key, capability_hash, expires_at, uploaded_at \
          FROM attachments WHERE attachment_id = ?1",
@@ -897,7 +1054,10 @@ mod tests {
                 &conn,
                 &MessageEnvelope {
                     protocol_version: ProtocolVersion::CURRENT,
-                    message_id: upm_protocol::MessageId::from_hex("00112233445566778899AABBCCDDEEFF").unwrap(),
+                    message_id: upm_protocol::MessageId::from_hex(
+                        "00112233445566778899AABBCCDDEEFF",
+                    )
+                    .unwrap(),
                     sender_device_id: upm_protocol::DeviceId::from_hex(&acc.device_id).unwrap(),
                     recipient_device_id: upm_protocol::DeviceId::from_hex(&acc.device_id).unwrap(),
                     ciphertext: b"still here after restart".to_vec(),
@@ -929,15 +1089,20 @@ mod tests {
     fn message_enqueue_pull_ack_lifecycle() {
         let conn = mem_db();
         let acc = register_account(&conn, "alice", "k").unwrap();
-        let msg_id = enqueue_message(&conn, &MessageEnvelope {
-            protocol_version: ProtocolVersion::CURRENT,
-            message_id: upm_protocol::MessageId::from_hex("00112233445566778899AABBCCDDEEFF").unwrap(),
-            sender_device_id: upm_protocol::DeviceId::from_hex(&acc.device_id).unwrap(),
-            recipient_device_id: upm_protocol::DeviceId::from_hex(&acc.device_id).unwrap(),
-            ciphertext: b"opaque-ciphertext".to_vec(),
-            server_timestamp: now() as u64,
-            expires_at: (now() + 3600) as u64,
-        }).unwrap();
+        let msg_id = enqueue_message(
+            &conn,
+            &MessageEnvelope {
+                protocol_version: ProtocolVersion::CURRENT,
+                message_id: upm_protocol::MessageId::from_hex("00112233445566778899AABBCCDDEEFF")
+                    .unwrap(),
+                sender_device_id: upm_protocol::DeviceId::from_hex(&acc.device_id).unwrap(),
+                recipient_device_id: upm_protocol::DeviceId::from_hex(&acc.device_id).unwrap(),
+                ciphertext: b"opaque-ciphertext".to_vec(),
+                server_timestamp: now() as u64,
+                expires_at: (now() + 3600) as u64,
+            },
+        )
+        .unwrap();
 
         let pulled = pull_messages(&conn, &acc.device_id).unwrap();
         assert_eq!(pulled.len(), 1);
@@ -958,7 +1123,8 @@ mod tests {
             &conn,
             &MessageEnvelope {
                 protocol_version: ProtocolVersion::CURRENT,
-                message_id: upm_protocol::MessageId::from_hex("00112233445566778899AABBCCDDEEFF").unwrap(),
+                message_id: upm_protocol::MessageId::from_hex("00112233445566778899AABBCCDDEEFF")
+                    .unwrap(),
                 sender_device_id: upm_protocol::DeviceId::from_hex(&alice.device_id).unwrap(),
                 recipient_device_id: upm_protocol::DeviceId::from_hex(&bob.device_id).unwrap(),
                 ciphertext: b"opaque-ciphertext".to_vec(),
@@ -968,7 +1134,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(ack_messages(&conn, &alice.device_id, &[msg_id.clone()]).unwrap(), 0);
+        assert_eq!(
+            ack_messages(&conn, &alice.device_id, &[msg_id.clone()]).unwrap(),
+            0
+        );
         assert_eq!(pull_messages(&conn, &bob.device_id).unwrap().len(), 1);
         assert_eq!(ack_messages(&conn, &bob.device_id, &[msg_id]).unwrap(), 1);
     }
@@ -977,7 +1146,7 @@ mod tests {
     fn device_key_refresh_is_bound_to_device() {
         let conn = mem_db();
         let acc = register_account(&conn, "alice", "ed-key").unwrap();
-        update_device_keys(&conn, &acc.device_id, "x" , "spk", "sig").unwrap();
+        update_device_keys(&conn, &acc.device_id, "x", "spk", "sig").unwrap();
         let stored: (String, String, String) = conn
             .query_row(
                 "SELECT identity_exchange_public, signed_prekey_public, signed_prekey_signature FROM devices WHERE device_id = ?1",
@@ -994,7 +1163,8 @@ mod tests {
         let acc = register_account(&conn, "bob", "k").unwrap();
         let envelope = MessageEnvelope {
             protocol_version: ProtocolVersion::CURRENT,
-            message_id: upm_protocol::MessageId::from_hex("00112233445566778899AABBCCDDEEFF").unwrap(),
+            message_id: upm_protocol::MessageId::from_hex("00112233445566778899AABBCCDDEEFF")
+                .unwrap(),
             sender_device_id: upm_protocol::DeviceId::from_hex(&acc.device_id).unwrap(),
             recipient_device_id: upm_protocol::DeviceId::from_hex(&acc.device_id).unwrap(),
             ciphertext: b"stale".to_vec(),
@@ -1014,15 +1184,20 @@ mod tests {
     fn enqueue_to_unknown_device_fails_closed() {
         let conn = mem_db();
         let sender = register_account(&conn, "alice", "k").unwrap();
-        let err = enqueue_message(&conn, &MessageEnvelope {
-            protocol_version: ProtocolVersion::CURRENT,
-            message_id: upm_protocol::MessageId::from_hex("00112233445566778899AABBCCDDEEFF").unwrap(),
-            sender_device_id: upm_protocol::DeviceId::from_hex(&sender.device_id).unwrap(),
-            recipient_device_id: upm_protocol::DeviceId([0u8; 16]),
-            ciphertext: b"x".to_vec(),
-            server_timestamp: now() as u64,
-            expires_at: (now() + 3600) as u64,
-        }).unwrap_err();
+        let err = enqueue_message(
+            &conn,
+            &MessageEnvelope {
+                protocol_version: ProtocolVersion::CURRENT,
+                message_id: upm_protocol::MessageId::from_hex("00112233445566778899AABBCCDDEEFF")
+                    .unwrap(),
+                sender_device_id: upm_protocol::DeviceId::from_hex(&sender.device_id).unwrap(),
+                recipient_device_id: upm_protocol::DeviceId([0u8; 16]),
+                ciphertext: b"x".to_vec(),
+                server_timestamp: now() as u64,
+                expires_at: (now() + 3600) as u64,
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, DbError::DeviceNotFound));
     }
 
@@ -1045,7 +1220,8 @@ mod tests {
         let conn = mem_db();
         let acc = register_account(&conn, "recycler", "k").unwrap();
 
-        let old = create_attachment(&conn, &acc.device_id, MAX_DEVICE_ATTACHMENT_BYTES - 10).unwrap();
+        let old =
+            create_attachment(&conn, &acc.device_id, MAX_DEVICE_ATTACHMENT_BYTES - 10).unwrap();
         conn.execute(
             "UPDATE attachments SET expires_at = ?1 WHERE attachment_id = ?2",
             params![now() - 1, old.attachment_id],
@@ -1089,7 +1265,11 @@ mod tests {
         assert_eq!(reaped_keys, vec![stale.storage_key]);
 
         // The fresh attachment must survive the sweep, the stale one must not.
-        assert!(get_attachment(&conn, &fresh.attachment_id).unwrap().is_some());
-        assert!(get_attachment(&conn, &stale.attachment_id).unwrap().is_none());
+        assert!(get_attachment(&conn, &fresh.attachment_id)
+            .unwrap()
+            .is_some());
+        assert!(get_attachment(&conn, &stale.attachment_id)
+            .unwrap()
+            .is_none());
     }
 }

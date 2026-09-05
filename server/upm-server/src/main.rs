@@ -20,6 +20,7 @@
 //!   to the SCM and shutting down cleanly on a Stop/Shutdown control
 //!   instead of being hard-killed.
 
+mod admin;
 mod api;
 mod auth;
 mod db;
@@ -43,13 +44,21 @@ use tiny_http::Server;
 /// process, as long as we catch it at the top of the loop below — a single
 /// bad request should degrade nothing beyond itself.
 fn worker_count() -> usize {
-    std::env::var("UPM_WORKER_THREADS").ok().and_then(|s| s.parse().ok()).filter(|n| *n > 0).unwrap_or(8)
+    std::env::var("UPM_WORKER_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(8)
 }
 
 /// How often the background sweep (expired messages/attachments/sessions,
 /// orphaned attachment blob files, WAL checkpoint) runs.
 fn sweep_interval() -> Duration {
-    let secs = std::env::var("UPM_SWEEP_INTERVAL_SECONDS").ok().and_then(|s| s.parse().ok()).filter(|n| *n > 0).unwrap_or(300);
+    let secs = std::env::var("UPM_SWEEP_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(300);
     Duration::from_secs(secs)
 }
 
@@ -60,6 +69,10 @@ pub struct ServerParts {
     state: Arc<AppState>,
     server: Arc<Server>,
     workers: usize,
+    /// The local-only admin dashboard listener (see admin.rs). `None` if
+    /// it failed to bind (e.g. port already in use) — that's a
+    /// nice-to-have failing, not a reason to refuse to serve the main API.
+    admin_server: Option<Arc<Server>>,
 }
 
 /// Binds the listener and constructs `AppState` from the same environment
@@ -72,9 +85,11 @@ pub fn build_server() -> ServerParts {
     let db_path = std::env::var("UPM_DB_PATH").unwrap_or_else(|_| "upm.sqlite3".to_string());
 
     let conn = db::open(&db_path).expect("failed to open/initialize SQLite database");
-    let attachment_dir: PathBuf =
-        std::env::var("UPM_ATTACHMENT_DIR").unwrap_or_else(|_| "upm-attachments".to_string()).into();
-    std::fs::create_dir_all(&attachment_dir).expect("failed to create attachment storage directory");
+    let attachment_dir: PathBuf = std::env::var("UPM_ATTACHMENT_DIR")
+        .unwrap_or_else(|_| "upm-attachments".to_string())
+        .into();
+    std::fs::create_dir_all(&attachment_dir)
+        .expect("failed to create attachment storage directory");
     let state = Arc::new(AppState {
         db: Mutex::new(conn),
         attachment_dir,
@@ -91,10 +106,32 @@ pub fn build_server() -> ServerParts {
 
     let server = Arc::new(Server::http(&bind_addr).expect("failed to bind HTTP listener"));
     let workers = worker_count();
-    println!("upm-server listening on http://{bind_addr} (db: {db_path}, {workers} worker threads)");
-    println!("Reminder: expose this only via a tunnel/reverse proxy that terminates TLS (SRS §10.1).");
+    println!(
+        "upm-server listening on http://{bind_addr} (db: {db_path}, {workers} worker threads)"
+    );
+    println!(
+        "Reminder: expose this only via a tunnel/reverse proxy that terminates TLS (SRS §10.1)."
+    );
 
-    ServerParts { state, server, workers }
+    let admin_bind =
+        std::env::var("UPM_ADMIN_BIND").unwrap_or_else(|_| "127.0.0.1:8788".to_string());
+    let admin_server = match Server::http(&admin_bind) {
+        Ok(s) => {
+            println!("upm-server: local admin dashboard at http://{admin_bind}/admin (never tunnel this port!)");
+            Some(Arc::new(s))
+        }
+        Err(e) => {
+            eprintln!("upm-server: admin dashboard disabled, failed to bind {admin_bind}: {e}");
+            None
+        }
+    };
+
+    ServerParts {
+        state,
+        server,
+        workers,
+        admin_server,
+    }
 }
 
 /// Runs the accept loop and background sweep until `shutdown` becomes
@@ -148,6 +185,23 @@ pub fn run_server(parts: ServerParts, shutdown: Arc<AtomicBool>) {
         }));
     }
 
+    // Single dedicated thread for the admin dashboard — it's local-only,
+    // low-traffic, and deliberately kept separate from the main worker
+    // pool so a bug in one can never affect the other.
+    let admin_handle = parts.admin_server.clone().map(|admin_server| {
+        let state = Arc::clone(&parts.state);
+        std::thread::spawn(move || {
+            while let Ok(request) = admin_server.recv() {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    admin::handle(&state, request)
+                }));
+                if outcome.is_err() {
+                    eprintln!("upm-server: admin dashboard handler panicked; still serving");
+                }
+            }
+        })
+    });
+
     while !shutdown.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -160,6 +214,12 @@ pub fn run_server(parts: ServerParts, shutdown: Arc<AtomicBool>) {
     }
     for handle in handles {
         let _ = handle.join();
+    }
+    if let Some(admin_server) = &parts.admin_server {
+        admin_server.unblock();
+    }
+    if let Some(admin_handle) = admin_handle {
+        let _ = admin_handle.join();
     }
     let _ = sweep_handle.join();
 

@@ -14,9 +14,17 @@ The repository currently contains:
 
 ## Important status
 
-This is **not yet a production release**. Windows service packaging, the Android/iOS/Web clients, fuzzing/interoperability testing, stronger key-change UX, and independent security review remain outstanding. The UPM X3DH-style protocol is not claimed to be Signal/X3DH standards-compatible without independent review.
+This is **not yet a production release**. The Android/iOS/Web clients, fuzzing/interoperability testing, and independent security review remain outstanding. The UPM X3DH-style protocol is not claimed to be Signal/X3DH standards-compatible without independent review.
 
-See `docs/ROADMAP.md`, `docs/SECURITY_REVIEW.md`, and the supplied UPM SRS for the authoritative requirements and release posture.
+See `docs/ROADMAP.md`, `docs/SECURITY_REVIEW.md`, and the supplied UPM SRS for the authoritative requirements and release posture. See `docs/BETA_DEPLOYMENT.md` for exposing the server beyond localhost (Cloudflare Tunnel) for real beta testers.
+
+## Running the server
+
+```text
+cargo run -p upm-server
+```
+
+Binds to `127.0.0.1:8787` by default (main API) plus `127.0.0.1:8788` (a local-only admin dashboard at `/admin` — never expose this port beyond localhost; see `docs/BETA_DEPLOYMENT.md`). On Windows, `upm-server install`/`upm-server uninstall` register it as a proper Windows service instead of running it in a console.
 
 ## Windows client
 

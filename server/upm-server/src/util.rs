@@ -2,6 +2,25 @@
 //! Kept local and tiny rather than pulling in another crate whose MSRV
 //! might not match this build's Rust 1.75 toolchain constraint.
 
+use std::fmt::Write;
+
+/// Lowercase-or-uppercase-agnostic hex encoding (caller picks via `upper`),
+/// shared by every hex-token helper in this crate (random tokens, digests,
+/// capability hashes) so there's exactly one place that does this instead
+/// of five near-identical `iter().map(format!).collect()` copies.
+pub fn hex_encode(bytes: &[u8], upper: bool) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
+            if upper {
+                let _ = write!(out, "{b:02X}");
+            } else {
+                let _ = write!(out, "{b:02x}");
+            }
+            out
+        })
+}
+
 const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub fn base64_encode(data: &[u8]) -> String {

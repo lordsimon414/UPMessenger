@@ -62,16 +62,18 @@ fn run_service() -> windows_service::Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_for_handler = Arc::clone(&shutdown);
 
-    let status_handle = service_control_handler::register(SERVICE_NAME, move |control_event| {
-        match control_event {
-            ServiceControl::Stop | ServiceControl::Shutdown | ServiceControl::Preshutdown => {
-                shutdown_for_handler.store(true, Ordering::SeqCst);
-                ServiceControlHandlerResult::NoError
-            }
-            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            _ => ServiceControlHandlerResult::NotImplemented,
-        }
-    })?;
+    let status_handle =
+        service_control_handler::register(
+            SERVICE_NAME,
+            move |control_event| match control_event {
+                ServiceControl::Stop | ServiceControl::Shutdown | ServiceControl::Preshutdown => {
+                    shutdown_for_handler.store(true, Ordering::SeqCst);
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                _ => ServiceControlHandlerResult::NotImplemented,
+            },
+        )?;
 
     status_handle.set_service_status(ServiceStatus {
         service_type: SERVICE_TYPE,
@@ -111,7 +113,8 @@ pub fn install() -> windows_service::Result<()> {
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
-    let exe_path = std::env::current_exe().expect("failed to determine the current executable's path");
+    let exe_path =
+        std::env::current_exe().expect("failed to determine the current executable's path");
 
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
@@ -134,7 +137,8 @@ pub fn install() -> windows_service::Result<()> {
     // Cosmetic (shows up in services.msc) — if this specific call doesn't
     // compile against whatever windows-service version actually resolves,
     // it's safe to just delete this one line; everything else still works.
-    let _ = service.set_description("UPM end-to-end encrypted messenger delivery server (SRS §10).");
+    let _ =
+        service.set_description("UPM end-to-end encrypted messenger delivery server (SRS §10).");
 
     println!("Service '{SERVICE_NAME}' installed with automatic start.");
     println!("Start it now with: sc start {SERVICE_NAME}");
